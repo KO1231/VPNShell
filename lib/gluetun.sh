@@ -364,7 +364,17 @@ gl_wait_healthy() {
 			echo >&2
 			vpnsh_err "gluetun が ${limit} 秒以内に healthy になりませんでした (状態: $GL_STATUS / $GL_HEALTH)。直近のログ:"
 			vpnsh_docker logs --tail 30 "$VPNSH_GLUETUN_NAME" 2>&1 | vpnsh_sanitize | sed 's/^/    /' >&2
-			vpnsh_err "秘密鍵や .env の値の誤り、NordVPN 側の問題、ネットワークの問題が考えられます"
+			case "$host_vpn" in
+				same)
+					vpnsh_err "Mac の NordVPN アプリなどが専用IPのサーバーに接続しています。アプリを切断するか、別のサーバーに接続してから再実行してください"
+					vpnsh_err "ほかに、秘密鍵や .env の値の誤り、NordVPN 側の問題、ネットワークの問題が考えられます"
+					;;
+				unknown)
+					vpnsh_err "秘密鍵や .env の値の誤り、NordVPN 側の問題、ネットワークの問題が考えられます"
+					vpnsh_err "Mac の NordVPN アプリなどが専用IPのサーバーに接続していないかも確かめてください"
+					;;
+				*) vpnsh_err "秘密鍵や .env の値の誤り、NordVPN 側の問題、ネットワークの問題が考えられます" ;;
+			esac
 			return 1
 		fi
 		[ $((i % 2)) -eq 0 ] && printf '.' >&2
