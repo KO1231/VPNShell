@@ -56,6 +56,21 @@ out="$(HOME="$T/home" PATH="$T/home/Projects/app/bin:./node_modules/.bin::$T/hom
 case ":$out:" in *"Projects"* | *":./"* | *"::"* | *"linked-bin"* | *nonexistent*) ng "残ってはいけないものが PATH に残った: $out" ;; *) ok "マウントできる場所の配下・相対パス・空・存在しない・シンボリックリンク経由のものを除く" ;; esac
 case ":$out:" in *":$T/home/bin:$T/other:"*) ok "それ以外は順序を保って残す" ;; *) ng "残すべきものが消えた: $out" ;; esac
 case ":$out:" in *":/usr/bin:/bin:/usr/sbin:/sbin:"*) ok "/usr/bin などを必ず含める" ;; *) ng "/usr/bin などが無い: $out" ;; esac
+# vpnsh は PATH を安全にするまで、元の PATH からコマンドを探さない
+# (mount-root の配下はコンテナから書き換えられるので、そこに置かれた偽の dirname などが Mac 側で動かないように)
+# 実際の .env (mount-root の設定など) に左右されないよう、bin と lib を .env の無い場所にコピーして起動する
+mkdir -p "$T/home4/Projects/app/bin" "$T/bin4" "$T/repo4"
+cp -R "$ROOT/bin" "$ROOT/lib" "$T/repo4/"
+for c in dirname readlink env sed cat tr grep awk perl; do
+	printf '#!/bin/sh\n/usr/bin/touch "%s/fake-called-%s"\nexec /usr/bin/%s "$@"\n' "$T" "$c" "$c" >"$T/home4/Projects/app/bin/$c"
+	chmod +x "$T/home4/Projects/app/bin/$c"
+done
+ln -s "$T/repo4/bin/vpnsh" "$T/bin4/vpnsh"
+out="$(HOME="$T/home4" PATH="$T/home4/Projects/app/bin:$PATH" "$T/bin4/vpnsh" --version 2>&1)"
+called="$(cd "$T" && ls fake-called-* 2>/dev/null | tr '\n' ' ')"
+[ -z "$called" ] && [ "$out" = "vpnsh $(sed -n 's/^VPNSH_VERSION="\(.*\)"$/\1/p' "$ROOT/bin/vpnsh")" ] &&
+	ok "PATH を安全にする前に、元の PATH (マウントできる場所の配下) のコマンドを使わない" ||
+	ng "元の PATH の偽のコマンドが呼ばれた: ${called:-なし} (出力: $out)"
 # 大文字・小文字を区別しないファイルシステム (APFS の既定) では、綴りを変えてもマウントできる場所の配下を指せる。
 # 区別するファイルシステムでも判定を通すよう、小文字の綴りのディレクトリを実際に作って試す
 mkdir -p "$T/home2/projects/app/bin" "$T/home2/bin"
