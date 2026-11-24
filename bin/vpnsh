@@ -11,6 +11,8 @@ umask 077
 # 元の PATH は、vpnsh_safe_path に渡すときと、doctor が「vpnsh が PATH から使えるか」を調べるときだけ使う
 VPNSH_ORIG_PATH="$PATH"
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
+# CDPATH があると、相対パスの cd が別のディレクトリに移り (移った先も表示する)、リポジトリの場所を取り違えるため
+unset CDPATH
 
 VPNSH_VERSION="1.0.1"
 

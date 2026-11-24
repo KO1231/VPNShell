@@ -71,6 +71,11 @@ called="$(cd "$T" && ls fake-called-* 2>/dev/null | tr '\n' ' ')"
 [ -z "$called" ] && [ "$out" = "vpnsh $(sed -n 's/^VPNSH_VERSION="\(.*\)"$/\1/p' "$ROOT/bin/vpnsh")" ] &&
 	ok "PATH を安全にする前に、元の PATH (マウントできる場所の配下) のコマンドを使わない" ||
 	ng "元の PATH の偽のコマンドが呼ばれた: ${called:-なし} (出力: $out)"
+# CDPATH が export されていても、相対パス (bin/vpnsh) で起動したときにリポジトリの場所を取り違えない
+mkdir -p "$T/cdpath5/bin"
+out="$(cd "$T/repo4" && HOME="$T/home4" CDPATH="$T/cdpath5" bin/vpnsh --version 2>&1)"
+[ "$out" = "vpnsh $(sed -n 's/^VPNSH_VERSION="\(.*\)"$/\1/p' "$ROOT/bin/vpnsh")" ] &&
+	ok "CDPATH があっても、リポジトリの場所を取り違えない" || ng "CDPATH でリポジトリの場所を取り違えた: $out"
 # 大文字・小文字を区別しないファイルシステム (APFS の既定) では、綴りを変えてもマウントできる場所の配下を指せる。
 # 区別するファイルシステムでも判定を通すよう、小文字の綴りのディレクトリを実際に作って試す
 mkdir -p "$T/home2/projects/app/bin" "$T/home2/bin"
