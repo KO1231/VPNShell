@@ -1,0 +1,21 @@
+# VPNShell の追加遮断ルール (gluetun の /iptables/post-rules.txt)
+#
+# gluetun は自分のルールをすべて -A (末尾) で入れるため、ここでは -I (先頭に挿入) を使う。
+# -A で足すと、先にある "-o lo -j ACCEPT" や eth0 サブネットの許可に先に当たって効かない。
+# このファイルは bin/vpnsh が .env の値で @@...@@ を置き換えて state/post-rules.txt に生成する。
+#
+# --- 送信 ---
+# 1. Docker 組み込み DNS (127.0.0.11) 宛てを、ポートを指定せずに REJECT する。
+#    (--dport 53 を付けると、Docker が nat 表で宛先ポートを書き換えるので素通りする)
+iptables -I OUTPUT 1 -d 127.0.0.11 -j REJECT
+# 2. eth0 から出てよいのは、WireGuard 自身のパケット (gluetun が付ける fwmark 0xca6c = 51820) で、
+#    VPN エンドポイント宛ての UDP だけ。目印の無いパケット (SO_BINDTODEVICE で eth0 を直接指定した
+#    権限なしのソケットなど) はここを通らず、3 で遮断される。
+iptables -I OUTPUT 2 -o eth0 -p udp -d @@ENDPOINT_IP@@ --dport @@ENDPOINT_PORT@@ -m mark --mark 0xca6c -j ACCEPT
+# 3. それ以外の eth0 への送信 (同じネットワークの他コンテナ、Mac 側) を遮断する。
+iptables -I OUTPUT 3 -o eth0 -j DROP
+# --- 受信 ---
+# 4. eth0 から受け取るのは VPN エンドポイントからのパケットだけ。
+iptables -I INPUT 1 -i eth0 ! -s @@ENDPOINT_IP@@ -j DROP
+# 5. それも確立済みの通信の応答だけ (新規・INVALID・UNTRACKED は遮断する)。
+iptables -I INPUT 2 -i eth0 -m conntrack ! --ctstate RELATED,ESTABLISHED -j DROP

@@ -1,0 +1,122 @@
+# VPNShell
+#
+# docker compose を直接実行しないでください。必ず bin/vpnsh 経由で操作します。
+# (vpnsh は COMPOSE_* / DOCKER_* 環境変数を消し、プロジェクト名・ファイル・context を固定し、
+#  secret をキーチェーンから取り出し、遮断ルールを生成してから compose を呼びます)
+
+name: vpnshell
+
+services:
+  gluetun:
+    # 安定版をマルチアーキテクチャのインデックスのダイジェストで固定 (scripts/update-pins で更新)
+    image: qmcgaw/gluetun:v3.41.3@sha256:fa19cc76b2af13d57a8d3dc3066f2ada061b1c761b8aecf989b3877c0486e027
+    container_name: ${VPNSH_GLUETUN_NAME:-vpnshell-gluetun}
+    cap_add:
+      - NET_ADMIN
+    # Docker 組み込み DNS の上流を明示する。こうすると転送がコンテナ側の名前空間から行われ、
+    # 遮断ルールで止まる (未指定だとホスト側から Mac の DNS へ素の IP で転送される)
+    dns:
+      - 1.1.1.1
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+      # 権限の無いプロセスは 1024 未満のポートで待ち受けられないようにする (名前空間ごとの値なので work にも効く)。
+      # 全シェルが同じネットワーク名前空間にいるため、これが無いと、あるシェルが 127.0.0.1:53 を先に取って
+      # 他のシェルの名前解決を乗っ取れる (gluetun の DNS が止まっている間など)
+      net.ipv4.ip_unprivileged_port_start: "1024"
+    environment:
+      VPN_SERVICE_PROVIDER: custom
+      VPN_TYPE: wireguard
+      WIREGUARD_ENDPOINT_IP: ${WIREGUARD_ENDPOINT_IP:-}
+      WIREGUARD_ENDPOINT_PORT: ${WIREGUARD_ENDPOINT_PORT:-51820}
+      WIREGUARD_PUBLIC_KEY: ${WIREGUARD_PUBLIC_KEY:-}
+      WIREGUARD_ADDRESSES: ${WIREGUARD_ADDRESSES:-}
+      WIREGUARD_MTU: ${WIREGUARD_MTU:-1320}
+      WIREGUARD_PERSISTENT_KEEPALIVE_INTERVAL: 25s
+      WIREGUARD_IMPLEMENTATION: auto
+      VERSION_INFORMATION: "off"
+      HTTP_CONTROL_SERVER_ADDRESS: 127.0.0.1:8000
+      HEALTH_RESTART_VPN: "on"
+    secrets:
+      # 秘密鍵 (キーチェーンから取り出した値を、作成時だけ環境変数で渡す)
+      - source: wireguard_private_key
+        mode: 0400
+      # 制御用サーバーの既定ロール (作成のたびに乱数の API キーを生成して渡す)
+      - source: http_control_server_auth_default_role
+        mode: 0400
+    volumes:
+      # 遮断ルール (vpnsh が templates/post-rules.txt.tmpl から生成する)。
+      # 元ファイルが無いときに Docker が空のディレクトリを作らないよう create_host_path: false
+      - type: bind
+        source: ${VPNSH_STATE_DIR:-./state}/post-rules.txt
+        target: /iptables/post-rules.txt
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 1s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  work:
+    profiles: ["work"]
+    build:
+      context: docker/work
+      args:
+        USER_UID: ${VPNSH_UID:-501}
+        USER_GID: ${VPNSH_GID:-20}
+        BASE_IMAGE: ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
+        VPNSH_BUILD_HASH: ${VPNSH_BUILD_HASH:-unknown}
+    image: vpnshell-work:local
+    network_mode: service:gluetun
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      # Docker の既定の seccomp から ptrace / process_vm_readv / process_vm_writev を外したもの。
+      # 同じシェルの中の別のプロセスが、対話 bash や SSH の中継を覗き見・操作できないようにする
+      # (元: github.com/moby/profiles seccomp/default.json @ 9ee3204f0d0c、sha256 3320527d…)
+      - seccomp=./templates/seccomp-work.json
+    init: true
+    stop_signal: SIGHUP
+    # 暴走 (fork bomb やメモリの使い切り) で OrbStack の VM 全体が不安定にならないように
+    pids_limit: 1024
+    mem_limit: 4g
+    # ルートのファイルシステムは読み取り専用 (root になられても、プログラムや vpnsh のスクリプトを
+    # すり替えられないように)。書き込めるのは /tmp・/var/tmp (tmpfs) とホーム (使い捨てボリューム) だけ
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,exec,size=1g
+      - /var/tmp:rw,nosuid,nodev,exec,size=256m
+    logging:
+      driver: none
+    volumes:
+      # ホームはコンテナごとの使い捨てボリューム (ディスク上なのでメモリを圧迫しない。--rm で消える)
+      - type: volume
+        target: /home/vpnsh
+      # DNS は gluetun 内蔵 (127.0.0.1) だけを使う。network_mode: service:gluetun のコンテナは
+      # gluetun の dns: 設定 (1.1.1.1) を引き継ぐため、上書きして固定する
+      - type: bind
+        source: ./templates/work-resolv.conf
+        target: /etc/resolv.conf
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      EXPECTED_PUBLIC_IP: ${EXPECTED_PUBLIC_IP:-}
+      VPNSH_IP_CHECK_URLS: ${VPNSH_IP_CHECK_URLS:-}
+      TZ: ${VPNSH_TZ:-UTC}
+
+secrets:
+  wireguard_private_key:
+    environment: VPNSH_WG_PRIVATE_KEY
+  http_control_server_auth_default_role:
+    environment: VPNSH_CONTROL_DEFAULT_ROLE
