@@ -1,17 +1,4 @@
 #!/bin/bash
-# VPNShell: work コンテナ内の起動前チェック
-#
-# 1つでも失敗したら 0 以外で終了する (entrypoint.sh がシェルを起動しない)。
-# 機械的な検査なので、全体を VPNSH_PREFLIGHT_BUDGET 秒 (既定 8 秒) で打ち切る (呼び出し側の timeout)。
-#
-# 入力 (環境変数):
-#   EXPECTED_PUBLIC_IP     照合する専用IP (setup の観測モードでは空)
-#   VPNSH_GLUETUN_NETNS    ホスト側で取得した gluetun のネットワーク名前空間 (net:[...])
-#   VPNSH_IP_CHECK_URLS    外部IP確認サービス (空白区切り。空なら既定の3か所)
-#   VPNSH_PREFLIGHT_MODE   "check" (既定) / "observe" (setup 用: 照合せず観測したIPを出力)
-# 出力:
-#   成功時、/tmp/vpnsh/state に PUBLIC_IP=... を書く (プロンプト表示用)
-#   observe モードでは、観測した IP を stdout に1行ずつ出す
 set -u
 
 MODE="${VPNSH_PREFLIGHT_MODE:-check}"
@@ -58,7 +45,6 @@ else
 fi
 
 # --- 2b. 権限の無いプロセスが 1024 未満のポートで待ち受けられないこと ---
-# (全シェルが同じ名前空間にいるので、これが無いと、あるシェルが 127.0.0.1:53 を取って他のシェルの名前解決を乗っ取れる)
 ups="$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start 2>/dev/null)"
 if [ "$ups" = "1024" ]; then
 	pass "1024 未満のポートは権限なしでは使えない"

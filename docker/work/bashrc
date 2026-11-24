@@ -1,13 +1,9 @@
-# VPNShell: work コンテナの bash 設定 (/etc/bash.bashrc として置く。root 所有、読み取り専用)
-# ホームにはひな形の .bashrc などを置いていない。
-
 # 対話シェルだけ。同じシェルで二重に読み込まない
 [[ $- == *i* ]] || return 0
 [[ -n "${__VPNSH_BASHRC_LOADED:-}" ]] && return 0
 __VPNSH_BASHRC_LOADED=1
 
-# ~/.local/bin に入れたツールを使えるようにする (ひな形の .profile の代わり)。
-# PATH の「後ろ」に足す: ここに置いた偽の ssh や git が、標準のものより優先されないように
+# ~/.local/bin は PATH の後ろに足す (偽の ssh や git が標準のものより優先されないように)
 case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$PATH:$HOME/.local/bin" ;; esac
 
 # 履歴はファイルに残さない (セッション内の ↑ は使える)
@@ -40,12 +36,7 @@ readonly VPNSH_MOUNT_LABEL
 # ターミナルのタイトル
 printf '\033]0;VPN %s\007' "$VPNSH_PUBLIC_IP"
 
-# プロンプトを表示するたびに、gluetun との接続状態を確認する (bash の組み込み機能だけなので軽い)
-#   eth0 が無い → gluetun が作り直された (この名前空間には二度と通信が戻らない)
-#   tun0 が無い → VPN 再接続中 (遮断は効いている)
-# (トンネルはあるのに通信できない状態は、Mac 側の vpnsh が監視して端末に直接知らせる。lib/netmon.sh)
-# PS1 は固定の文字列にし、値は表示のときに変数として展開させる
-# (値を PS1 に直接埋め込むと、値の中の $(...) がコマンドとして実行され得るため)
+# プロンプトのたびに gluetun との接続状態を確かめる (eth0 が無い → 作り直された / tun0 が無い → 再接続中)
 __vpnsh_prompt() {
 	local rc=$?
 	if [[ ! -e /sys/class/net/eth0 ]]; then
@@ -63,6 +54,7 @@ __vpnsh_prompt() {
 	return 0
 }
 PROMPT_COMMAND=__vpnsh_prompt
+# PS1 は固定の文字列にし、値は表示のときに展開させる (値の中の $(...) を実行させない)
 PS1='\[${VPNSH_STATUS_COLOR}\]${VPNSH_STATUS_TEXT}\[\e[0m\]\[\e[1;42;30m\] VPN ${VPNSH_PUBLIC_IP} \[\e[0m\] \[\e[35m\]${VPNSH_MOUNT_LABEL}\[\e[0m\]\[\e[36m\]\w\[\e[0m\] ${VPNSH_MARK} '
 
 alias ls='ls --color=auto'

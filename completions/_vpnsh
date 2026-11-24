@@ -1,14 +1,10 @@
 #compdef vpnsh
-# vpnsh の zsh 補完
-#
-# 使い方: vpnsh install-shell を実行すると、~/.zshrc に PATH とこの補完の設定が追記されます
 
 _vpnsh() {
 	local curcontext="$curcontext" state line ret=1
 	typeset -A opt_args
 
-	# 一覧の変数名を commands にしないこと: zsh の特別な連想配列 $commands (コマンド名 → パス) が隠れ、
-	# _vpnsh_hosts が vpnsh の場所を見つけられなくなる
+	# 変数名を commands にしない (zsh の特別な連想配列 $commands が隠れる)
 	local -a vpnsh_cmds
 	vpnsh_cmds=(
 		'shell:固定IPのシェルに入る (既定)'

@@ -1,19 +1,5 @@
 # shellcheck shell=bash
 # shellcheck disable=SC2119,SC2120  # ssh_render_fingerprints の出力先は省略できる (doctor だけが指定する)
-# SSH (vpnsh --ssh): 専用 ssh-agent、接続先の設定、コンテナ用の ssh_config の生成
-#
-# 方針
-# - Mac の普段の ssh / git には一切影響しない。macOS 標準の ssh-agent、~/.ssh/config、
-#   macOS 全体の環境変数には触らない。vpnsh 専用の ssh-agent を別に起動する
-# - 鍵はコンテナに入れない。コンテナの ssh は中継を通じて専用 ssh-agent に署名を頼む。
-#   中継は ssh が認証に使う要求 (鍵の一覧・署名・session-bind) だけを通す
-# - 専用 ssh-agent に登録する鍵は「使うたびに確認ダイアログ (-c)」「8時間で期限切れ (-t)」
-#   「接続先のサーバーに縛る (-h)」。外部ライブラリは読み込ませない (-P none)
-# - 接続先は vpnsh ssh host add で ~/.ssh/config の Host から読み取り、state/hosts 1か所にまとめる。
-#   そこから、シェルごとにコンテナ用の設定を生成する (開いている他のシェルの設定には触れない)。
-#   ~/.ssh/config・known_hosts・公開鍵の一覧はコンテナに見せない
-# - コンテナ用の ssh_config の値は「既定」であり、強制ではない (シェルの中のコードは
-#   ~/.ssh/config や ssh -o で変えられる)。安全性は、中継の絞り込み・-c・-h・-t で担保する
 
 SSH_HOSTS_FILE="$VPNSH_STATE_DIR/hosts"
 SSH_KNOWN_HOSTS="$VPNSH_STATE_DIR/known_hosts"
@@ -26,12 +12,7 @@ SSH_KEY_LIFETIME_SECS=28800
 SSH_IN_SOCK="/tmp/vpnsh-agent/agent.sock"
 
 # ---- state/hosts ----
-# vpnsh ssh host add が書く (手で編集しない)。書式 (1行に1台。# で始まる行はコメント):
-#   <名前> <HostName> <ポート> <ユーザー> <秘密鍵のパス>
-# 例:
-#   serverA  serverA.example.com  22  deploy  ~/.ssh/id_serverA
-# 秘密鍵のパスは Mac 上のもの (コンテナには渡さない)。同じディレクトリに .pub があること。
-# どの項目にも空白・# ・制御文字は使えない (書くときに検証する)
+# 書式: <名前> <HostName> <ポート> <ユーザー> <秘密鍵のパス> (1行に1台。vpnsh ssh host add が書く)
 
 # ssh_key_path_ok <絶対パス>  鍵のパスとして使えるか (空白・#・制御文字を含まない絶対パス)
 ssh_key_path_ok() {
@@ -41,7 +22,6 @@ ssh_key_path_ok() {
 }
 
 # ssh_hosts  検証済みの行を「名前 HostName ポート ユーザー 鍵の絶対パス」で出す。不正な行があれば 1
-# (perl 1回で検証する。接続先が多くても速いように)
 ssh_hosts() {
 	[ -f "$SSH_HOSTS_FILE" ] || return 0
 	VPNSH_HOME="$HOME" perl -ne '
@@ -83,7 +63,7 @@ ssh_has_known_host() {
 ssh_fp() { ssh-keygen -lf "$1.pub" 2>/dev/null | awk '{print $2}'; }
 
 # ---- 専用 ssh-agent ----
-# ssh_agent_rc  0=鍵あり / 1=鍵なし / 2=動いていない / 124=応答なし (確認ダイアログの表示中など)
+# ssh_agent_rc  0=鍵あり / 1=鍵なし / 2=動いていない / 124=応答なし
 ssh_agent_rc() {
 	[ -S "$SSH_AGENT_SOCK" ] || return 2
 	SSH_AUTH_SOCK="$SSH_AGENT_SOCK" vpnsh_timeout 3 /usr/bin/ssh-add -l >/dev/null 2>&1
@@ -100,8 +80,7 @@ ssh_agent_start() {
 	ssh_agent_rc; rc=$?
 	[ "$rc" -eq 2 ] || return 0
 	mkdir -p "$SSH_AGENT_DIR" && chmod 0700 "$SSH_AGENT_DIR"
-	# 2つの vpnsh ssh add が同時に起動しないよう、起動の部分だけロックする
-	# (同時に起動すると、片方の ssh-agent がソケットも記録も失ったまま残る)。30秒より古いロックは残骸とみなす
+	# 起動の部分だけロックする (30秒より古いロックは残骸とみなす)
 	lk="$SSH_AGENT_DIR/start.lock"
 	while ! mkdir "$lk" 2>/dev/null; do
 		if [ $(($(date +%s) - $(stat -f %m "$lk" 2>/dev/null || date +%s))) -ge 30 ]; then rmdir "$lk" 2>/dev/null; continue; fi
@@ -125,8 +104,7 @@ ssh_agent_start() {
 	return 0
 }
 
-# ssh_agent_stop  専用 ssh-agent を止める。PID が再利用されて別のプロセスになっていても止めないよう、
-# コマンドラインに自分のソケットのパスがあることを確かめる (Mac 標準の ssh-agent を止めないため)
+# ssh_agent_stop  専用 ssh-agent を止める (コマンドラインに自分のソケットのパスがあるものだけ)
 ssh_agent_stop() {
 	local pid args
 	pid="$(cat "$SSH_AGENT_DIR/pid" 2>/dev/null)"
@@ -145,9 +123,7 @@ ssh_added_names() { awk -F '\t' -v f="$1" '$1 == f { n = $3 } END { print n }' "
 # ssh_added_time <指紋>
 ssh_added_time() { awk -F '\t' -v f="$1" '$1 == f { t = $2 } END { print t }' "$SSH_AGENT_DIR/added" 2>/dev/null; }
 
-# ssh_add [名前...]  鍵を専用 ssh-agent に登録する (Mac のターミナルで。パスフレーズもここで入力する)
-# 名前を指定しても、その鍵を使う「すべての接続先」をまとめて縛る (-h を並べる)。
-# ssh-agent は同じ鍵を登録し直すと縛りを置き換えるので、一部だけで登録すると他の接続先で使えなくなるため
+# ssh_add [名前...]  鍵を専用 ssh-agent に登録する (その鍵を使うすべての接続先をまとめて縛る)
 ssh_add() {
 	local all lines key dests names line name host port user k kh fp missing=0 nk=0
 	all="$(ssh_hosts)" || return 1
@@ -207,8 +183,7 @@ EOF
 	vpnsh_info "次は: vpnsh --ssh でシェルに入り、ssh <名前> や git clone <名前>:<パス> を実行してください"
 }
 
-# ssh_render_fingerprints [出力先のディレクトリ]  確認ダイアログの表示用に「指紋 → 名前 (ユーザー@接続先)」の対応表を作る
-# (コンテナには見せない。出力先の既定は state/ssh。doctor は比べるために別の場所に作る)
+# ssh_render_fingerprints [出力先のディレクトリ]  確認ダイアログ用の「指紋 → 名前 (ユーザー@接続先)」の対応表を作る
 ssh_render_fingerprints() {
 	local all name host port user k fp tmp out="${1:-$SSH_GEN_DIR}"
 	all="$(ssh_hosts)" || return 1
@@ -225,10 +200,7 @@ EOF
 	mv -f "$tmp" "$out/fingerprints"
 }
 
-# ssh_list [-a|--all]
-#   既定: 専用 ssh-agent が今メモリに持っている鍵 (使える接続先、期限までの残り時間)
-#   -a / --all: 登録した接続先をすべて (鍵がメモリにないもの、ホスト鍵が未保存のものも含む)
-# どちらも最後に、直近の確認ダイアログの結果を出す
+# ssh_list [-a|--all]  メモリにある鍵 (-a: 登録したすべての接続先) と、直近の確認ダイアログの結果を出す
 ssh_list() {
 	local all="" rc loaded="" now fp t names hosts name host port user k known state shown
 	case "${1:-}" in -a | --all) all=1 ;; "") ;; *) vpnsh_die "使い方: vpnsh ssh list [-a|--all]" 2 ;; esac
@@ -309,15 +281,12 @@ EOF
 }
 
 # ---- シェルごとの設定 (コンテナにマウントする) ----
-# 生成物はシェルごとの別ディレクトリ (state/ssh/s.<vpnsh の PID>) に作り、そのシェルの終了時に消す。
-# 開いている他のシェルがマウントしているファイルを置き換えると、その瞬間に他のシェルの ssh が失敗するため。
+# 生成物はシェルごとのディレクトリ (state/ssh/s.<PID>) に作り、終了時に消す
 
 # ssh_session_dir <PID>
 ssh_session_dir() { printf '%s' "$SSH_GEN_DIR/s.$1"; }
 
-# ssh_render_session <ディレクトリ> [接続先の一覧]  ssh_config・公開鍵・known_hosts を作る
-# IdentityFile は「秘密鍵の無いパス」を指し、同じ名前の .pub だけを置く。ssh は .pub で鍵を特定して
-# エージェントに頼み、メモリに鍵が無いときも .pub を秘密鍵として読もうとしない (誤解を招く警告を出さない)
+# ssh_render_session <ディレクトリ> [接続先の一覧]  ssh_config・公開鍵 (.pub だけ)・known_hosts を作る
 ssh_render_session() {
 	local dir="$1" all="${2:-}" name host port user k cm
 	[ -n "$all" ] || all="$(ssh_hosts)" || return 1
@@ -383,8 +352,7 @@ ssh_session_gc() {
 	return 0
 }
 
-# ssh_valid_keyscan_line <行> <known_hosts での名前>  ssh-keyscan の出力として正しい形で、接続先の行か
-# (指定子 @cert-authority やハッシュ化した行、別のホストの行は拒否する)
+# ssh_valid_keyscan_line <行> <known_hosts での名前>  ssh-keyscan の出力として正しい、接続先の行か
 ssh_valid_keyscan_line() {
 	local first="${1%% *}"
 	[ "$first" = "$2" ] || return 1
@@ -392,9 +360,7 @@ ssh_valid_keyscan_line() {
 }
 
 # ---- ~/.ssh/config からの登録 (vpnsh ssh host add) ----
-# ssh -G で、その Host に最終的に適用される設定を Mac 側で読む (Include や Match も ssh が解釈する)。
-# ~/.ssh/config はコンテナに見せない。読むだけなので、普段の ssh には影響しない。
-# 注意: ~/.ssh/config に Match exec があると、ssh -G はその中のコマンドを実行する (普段の ssh と同じ動作)
+# ssh -G で、その Host に適用される設定を Mac 側で読む (Match exec があるとそのコマンドが実行される)
 # shellcheck disable=SC2088  # ssh -G が出力するそのままの文字列と比べる
 SSH_DEFAULT_IDS="~/.ssh/id_rsa ~/.ssh/id_ecdsa ~/.ssh/id_ecdsa_sk ~/.ssh/id_ed25519 ~/.ssh/id_ed25519_sk ~/.ssh/id_mldsa44_ed25519 ~/.ssh/id_xmss ~/.ssh/id_dsa"
 
@@ -402,16 +368,14 @@ SSH_DEFAULT_IDS="~/.ssh/id_rsa ~/.ssh/id_ecdsa ~/.ssh/id_ecdsa_sk ~/.ssh/id_ed25
 ssh_cfg_args() { [ -n "${VPNSH_TEST_SSH_CONFIG:-}" ] && printf '%s\n' -F "$VPNSH_TEST_SSH_CONFIG"; return 0; }
 
 # shellcheck disable=SC2034  # SR_* は呼び出し側 (bin/vpnsh) が使う
-# ssh_resolve <Host名>  SR_HOST / SR_PORT / SR_USER / SR_IDS (改行区切り、~ は展開済み) / SR_IDS_DEFAULT (1=既定の候補だけ) /
-#                       SR_PROXY (踏み台の設定) / SR_INCONFIG (1=~/.ssh/config に Host がある) を設定する
+# ssh_resolve <Host名>  SR_HOST / SR_PORT / SR_USER / SR_IDS / SR_IDS_DEFAULT / SR_PROXY / SR_INCONFIG を設定する
 ssh_resolve() {
 	local alias="$1" out probe_out probe args=() line k v ids="" raw_ids=""
 	while IFS= read -r line; do [ -n "$line" ] && args+=("$line"); done <<EOT
 $(ssh_cfg_args)
 EOT
 	out="$(/usr/bin/ssh -G ${args[@]+"${args[@]}"} -- "$alias" </dev/null 2>/dev/null)" || { vpnsh_err "ssh -G $alias を実行できません (~/.ssh/config の書き方を確認してください)"; return 1; }
-	# ~/.ssh/config に Host があるかは、「存在しない名前」を同じ条件で読んだ結果と比べて判定する
-	# (macOS ではシステム全体の設定 /etc/ssh/ssh_config も読まれるので、設定なしとは比べられない)
+	# Host があるかは、存在しない名前を読んだ結果と比べて判定する
 	probe="vpnsh-probe-$$-$RANDOM"
 	probe_out="$(/usr/bin/ssh -G ${args[@]+"${args[@]}"} -- "$probe" </dev/null 2>/dev/null)"
 	SR_INCONFIG=1
@@ -439,8 +403,7 @@ $out
 EOT
 	SR_IDS="${ids%
 }"
-	# IdentityFile を書いていない Host では、ssh -G は既定の候補を並べる (並び方は OpenSSH の版で変わる)。
-	# 2つ以上あり、すべてが既定の名前なら「書いていない」とみなす
+	# IdentityFile が2つ以上あり、すべて既定の名前なら「書いていない」とみなす
 	SR_IDS_DEFAULT=0
 	local cnt=0 all_default=1 f
 	for f in $raw_ids; do
@@ -451,8 +414,7 @@ EOT
 	return 0
 }
 
-# ssh_hosts_put <名前> <HostName> <ポート> <ユーザー> <鍵>  state/hosts に書く (同じ名前の行は置き換える)
-# 書く前に値を検証し、書いた結果も検証してから置き換える
+# ssh_hosts_put <名前> <HostName> <ポート> <ユーザー> <鍵>  検証してから state/hosts に書く (同じ名前の行は置き換える)
 ssh_hosts_put() {
 	local tmp="$SSH_HOSTS_FILE.tmp.$$" keyshow="$5"
 	ssh_key_path_ok "$5" || { vpnsh_err "秘密鍵のパスに空白・#・制御文字は使えません: $5"; return 1; }

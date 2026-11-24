@@ -1,12 +1,4 @@
 # shellcheck shell=bash
-# 一定時間シェルを使わなければ、gluetun を自動で破棄する (vpnsh config set idle-down <時間> | off)
-#
-# - macOS の LaunchAgent (利用者ごとの定期実行) に「vpnsh idle-check」を15分ごとに登録する。
-#   ターミナルを全部閉じても、Mac を再起動しても動き、スリープしていた時間も正しく数えられる
-# - 開いているシェルが無く、最後にシェルを閉じてから (一度も開いていなければ gluetun の起動から) 指定の時間が
-#   たっていれば、vpnsh down と同じこと (シェルを閉じる・gluetun を破棄する・専用 ssh-agent を止める) を行う
-# - 次の vpnsh で gluetun を作り直す (キーチェーンの確認が出て、VPN の接続に十数秒かかる)
-# - 登録するのは有効にしたときだけ。無効にすると登録を外してファイルも消す。Mac の普段の通信や ssh には影響しない
 
 IDLE_LABEL="local.vpnshell.idle-down"
 IDLE_PLIST="$HOME/Library/LaunchAgents/$IDLE_LABEL.plist"

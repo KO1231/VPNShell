@@ -1,21 +1,10 @@
 #!/bin/bash
-# VPNShell: work コンテナの入口
-#
-#   entrypoint.sh shell              起動前チェック → 対話 bash
-#   entrypoint.sh run <cmd> [args]   起動前チェック → コマンドを実行 (終了コードをそのまま返す)
-#   entrypoint.sh check              起動前チェックだけ
-#   entrypoint.sh full               起動前チェック → 漏れの実地検査 (vpnsh check --full)
-#   entrypoint.sh mtu                起動前チェック → MTU の診断 (vpnsh check --mtu)
-#   entrypoint.sh observe            setup 用: 照合せず、観測した外部IPを出力
-#
-# 起動前チェックに失敗したら 125 で終了する (チェックを飛ばす手段は用意しない)
 set -u
 
 EXIT_PREFLIGHT=125
 BUDGET="${VPNSH_PREFLIGHT_BUDGET:-8}"
 
 # --timing: Mac 側から渡された時刻 (ミリ秒) を起点に、段階ごとの所要時間を出す
-# (コンテナの時計は Mac と数ミリ秒ずれることがある)
 now_ms() { local t="${EPOCHREALTIME/./}"; printf '%s' "$((t / 1000))"; }
 tmark() {
 	[ -n "${VPNSH_TIMING:-}" ] && [ -n "${VPNSH_TIMING_T0:-}" ] || return 0

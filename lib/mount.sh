@@ -1,14 +1,4 @@
 # shellcheck shell=bash
-# カレントディレクトリを work コンテナにマウントするときの安全策
-#
-# 判定はパスの文字列ではなく inode (デバイス番号:inode 番号) で行う。
-# macOS (APFS) は大文字小文字を区別しないので、文字列で比べると `cd ~/.SSH` のような
-# 書き方ですり抜けられる。シンボリックリンクも実体で判定する。
-#
-# 許可するのは「マウントを許可するディレクトリ (mount-root。既定 ~/Projects) の配下」だけ。ただし次は拒否する。
-#   - 許可するディレクトリそのもの
-#   - VPNShell リポジトリそのもの、その配下、その祖先 (確認ダイアログのスクリプトなどを書き換えられないように)
-#   - パスに : や , や制御文字を含むもの (docker の -v の書式が壊れるため)
 
 # mnt_chain <ディレクトリ>  そのディレクトリから / までの inode を1行ずつ出す (".." を実体でたどる)
 mnt_chain() {
@@ -25,10 +15,7 @@ mnt_chain() {
 	' "$1"
 }
 
-# mnt_root_ok <ディレクトリ>  マウントを許可する場所 (mount-root) として使えるなら、実体の絶対パスを出す
-# 使えるのは「ホームの中のディレクトリ」で、ホームそのもの・. で始まるディレクトリ (~/.ssh など) の中・
-# ~/Library の中は不可 (秘密の情報を含む場所を、うっかりマウントできてしまわないように)。
-# .env に書くので、使える文字は英数字と . _ - / だけ
+# mnt_root_ok <ディレクトリ>  mount-root として使えるなら実体の絶対パスを出す (ホームの中だけ。ホーム自体・. で始まる場所・~/Library は不可)
 mnt_root_ok() {
 	local d="$1" real home rel
 	# shellcheck disable=SC2088  # 入力の "~/" という文字を $HOME に置き換える
@@ -40,8 +27,7 @@ mnt_root_ok() {
 	case "$real" in "$home"/*) ;; *) vpnsh_err "mount-root はホームの中のディレクトリにしてください (ホームそのものは不可): $real"; return 1 ;; esac
 	rel="${real#"$home"/}"
 	case "/$rel/" in */.*) vpnsh_err "mount-root に . で始まるディレクトリ (~/.ssh など) は使えません: $real"; return 1 ;; esac
-	# APFS は既定で大文字・小文字を区別せず、cd -P / pwd も入力の綴りのまま返すので、小文字にそろえて比べる
-	# (~/library や ~/LIBRARY でも ~/Library の中を指せてしまうため)
+	# APFS は大文字・小文字を区別しないので、小文字にそろえて比べる
 	case "$(vpnsh_lc "$rel")/" in library/*) vpnsh_err "mount-root に ~/Library の中は使えません: $real"; return 1 ;; esac
 	printf '%s' "$real" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/-]+$' ||
 		{ vpnsh_err "mount-root のパスに使えない文字があります (英数字と . _ - / だけ): $real"; return 1; }
@@ -51,8 +37,7 @@ mnt_root_ok() {
 # mnt_id <パス>  inode を出す
 mnt_id() { perl -e 'my @s = stat($ARGV[0]) or exit 1; print "$s[0]:$s[1]\n"' "$1"; }
 
-# mnt_check <対象ディレクトリ> <許可するディレクトリ> <VPNShell リポジトリ>
-# 問題なければ、マウントに使う実体のパスを stdout に出して 0。問題があれば理由を出して 1
+# mnt_check <対象> <許可するディレクトリ> <VPNShell リポジトリ>  問題なければ実体のパスを出して 0、あれば理由を出して 1
 mnt_check() {
 	local target="$1" root="$2" repo="$3" phys t_id r_id p_id chain repo_chain
 	if [ ! -d "$target" ]; then vpnsh_err "マウントするディレクトリがありません: $target"; return 1; fi
