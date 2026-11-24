@@ -9,7 +9,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 # CDPATH があると、相対パスの cd が別のディレクトリに移り (移った先も表示する)、リポジトリの場所を取り違えるため
 unset CDPATH
 
-VPNSH_VERSION="1.0.2"
+VPNSH_VERSION="1.0.3"
 
 # 対象のプロジェクトやコンテナ名を環境変数で上書きさせない (テストは lib を直接使う)
 unset VPNSH_PROJECT VPNSH_CONTEXT VPNSH_GLUETUN_NAME VPNSH_STATE_DIR VPNSH_ENV_FILE VPNSH_TEST_SSH_CONFIG
