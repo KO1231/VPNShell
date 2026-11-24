@@ -67,7 +67,8 @@ for c in dirname readlink env sed cat tr grep awk perl; do
 done
 ln -s "$T/repo4/bin/vpnsh" "$T/bin4/vpnsh"
 out="$(HOME="$T/home4" PATH="$T/home4/Projects/app/bin:$PATH" "$T/bin4/vpnsh" --version 2>&1)"
-called="$(cd "$T" && ls fake-called-* 2>/dev/null | tr '\n' ' ')"
+called=""
+for f in "$T"/fake-called-*; do [ -e "$f" ] && called="$called${f##*/} "; done
 [ -z "$called" ] && [ "$out" = "vpnsh $(sed -n 's/^VPNSH_VERSION="\(.*\)"$/\1/p' "$ROOT/bin/vpnsh")" ] &&
 	ok "PATH を安全にする前に、元の PATH (マウントできる場所の配下) のコマンドを使わない" ||
 	ng "元の PATH の偽のコマンドが呼ばれた: ${called:-なし} (出力: $out)"
