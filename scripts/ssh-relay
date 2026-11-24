@@ -14,6 +14,15 @@
 # 拒否が多すぎるときは中継を終える (シェルも閉じる)。
 # (コンテナ内のコードが自分の鍵を追加して確認ダイアログや記録を偽装したり、鍵を消したり
 #  ロックしたりするのを防ぐ)。承認の判断は ssh-agent の -c と確認ダイアログが行う。
+# 署名 (13) が失敗 (確認ダイアログで拒否・時間切れ) した回数も数え、短い間に続くか累計が多ければ中継を終える
+# (シェルも閉じる)。乗っ取られたシェルが確認ダイアログを出し続けて、うっかり「許可」を押させるのを防ぐ。
+# 専用 ssh-agent の応答は中身を変えずにそのまま転送し、数えるために読むだけにする。
+# - 署名の要求は、中継全体で1件ずつ専用 ssh-agent へ送る (前の署名の応答が返るまで、後の要求は中継の中で待たせる)。
+#   まとめて送られると ssh-agent はダイアログを続けて出し、失敗を数えられるのは全部終わった後になるため
+# - 応答の前に接続を閉じた署名の要求も失敗として数える (ssh-agent は接続が閉じてもダイアログを出し続けるので、
+#   数えないと、閉じるだけでダイアログを出し放題になる)
+# - ダイアログの出ない失敗 (接続先に縛った鍵を session-bind の無い接続で使った場合など) は数えない
+#   (ダイアログは session-bind 済みの接続でしか出ない。縛っていない鍵に備え、応答に時間がかかった失敗は数える)
 # docker exec は対象のコンテナにしか届かないので、ネットワークの遮断ルールに穴を開けない。
 # 枠の形式は docker/work/ssh-relay を参照。
 use strict;
@@ -25,6 +34,7 @@ use IPC::Open2;
 use Socket qw(SOCK_STREAM);
 use Errno qw(EAGAIN EWOULDBLOCK EINTR);
 use POSIX qw(strftime);
+use Time::HiRes ();
 
 my ($cid, $agent, $context, $audit) = @ARGV;
 die "usage: ssh-relay <container> <agent-socket> <context> [audit-log]\n" unless $cid && $agent && $context;
@@ -40,6 +50,14 @@ my $DENY_MAX = 1000;      # 1本の中継で拒否がこれを超えたら、中
 my $AUDIT_MAX = 1048576;  # 記録ファイルがこれを超えたら、1世代だけ残して入れ替える
 my ($denied, $suppressed, $last_summary) = (0, 0, time);
 my $SESSION_BIND = 'session-bind@openssh.com';
+# 署名の失敗が、直近 $SIGN_FAIL_WINDOW 秒の間に $SIGN_FAIL_MAX 回、または1本の中継の累計で
+# $SIGN_FAIL_TOTAL 回に達したら、中継を終える (間隔を空けて出し続けるのも防ぐ)
+my $SIGN_FAIL_MAX = 3;
+my $SIGN_FAIL_WINDOW = 300;
+my $SIGN_FAIL_TOTAL = 5;
+my $SIGN_SLOW = 1;        # 応答までこの秒数以上かかった失敗は、確認ダイアログが出たものとみなす
+my @sign_fail;            # 署名が失敗した時刻 (直近 $SIGN_FAIL_WINDOW 秒の分だけ残す)
+my $sign_fail_total = 0;
 
 # docker exec の stderr (コンテナ側の警告など) は端末に出さない
 open(STDERR, '>', '/dev/null');
@@ -56,6 +74,12 @@ $SIG{INT} = $done;
 
 my $sel = IO::Select->new($from);
 my (%conn, %id_of, %req);    # %req: 接続ごとの、コンテナから来た未処理のバイト列
+# 接続ごとの、専用 ssh-agent へ送って応答を待っている要求の種類 (1バイトずつ、送った順) と、
+# 専用 ssh-agent から来た未処理のバイト列 (応答は要求の順に1つずつ返る)、
+# 署名の要求を送った時刻 (送った順)、session-bind が成功した接続か
+my (%pend, %resp, %sent13, %bound);
+my $inflight13;    # 署名の応答を待っている接続の番号 (中継全体で1件まで)
+my @wait13;        # 署名の要求を送る順番を待っている接続の番号 (来た順)
 my $inbuf = '';
 
 sub audit {
@@ -85,12 +109,32 @@ sub send_frame {
 }
 sub close_conn {
 	my ($id, $notify) = @_;
+	# 応答を待っている署名の要求は、失敗として数える (片付けてから数える。数えた結果で中継を終えることがあるため)
+	my $unanswered = grep { $_ == 13 } unpack('C*', $pend{$id} // '');
 	delete $req{$id};
-	my $c = delete $conn{$id} or return;
-	delete $id_of{fileno $c} if defined fileno $c;
-	$sel->remove($c);
-	close $c;
-	send_frame('C', $id) if $notify;
+	delete $pend{$id};
+	delete $resp{$id};
+	delete $sent13{$id};
+	delete $bound{$id};
+	my $c = delete $conn{$id};
+	if ($c) {
+		delete $id_of{fileno $c} if defined fileno $c;
+		$sel->remove($c);
+		close $c;
+		send_frame('C', $id) if $notify;
+	}
+	@wait13 = grep { $_ != $id } @wait13;
+	sign_failed('closed-before-response') for 1 .. $unanswered;
+	release13() if defined $inflight13 && $inflight13 == $id;
+}
+
+# release13  署名の応答が返った (またはその接続が閉じた) ので、待たせている接続の署名の要求を来た順に送る
+sub release13 {
+	undef $inflight13;
+	while (!defined $inflight13 && @wait13) {
+		my $id = shift @wait13;
+		filter_requests($id) if $conn{$id};
+	}
 }
 
 # deny <番号> <種類>  失敗 (SSH_AGENT_FAILURE) を返してその接続を閉じ、件数を絞って記録する
@@ -122,6 +166,11 @@ sub filter_requests {
 		my $len = unpack('N', $req{$id});
 		if ($len < 1 || $len > $MAX) { close_conn($id, 1); return; }
 		last if length($req{$id}) < 4 + $len;
+		# 別の署名の応答を待っている間は、この接続の署名の要求 (と、その後ろの要求) を送らずに待たせる
+		if (ord(substr($req{$id}, 4, 1)) == 13 && defined $inflight13) {
+			push @wait13, $id unless grep { $_ == $id } @wait13;
+			last;
+		}
 		my $msg = substr($req{$id}, 0, 4 + $len, '');
 		my $type = ord(substr($msg, 4, 1));
 		my $ok = $ALLOW{$type};
@@ -130,12 +179,62 @@ sub filter_requests {
 			$ok = 1 if $nlen == length($SESSION_BIND) && substr($msg, 9, $nlen) eq $SESSION_BIND;
 		}
 		if ($ok) {
+			$pend{$id} .= chr($type);
+			if ($type == 13) {
+				push @{$sent13{$id}}, Time::HiRes::time();
+				$inflight13 = $id;
+			}
 			write_all($c, $msg) or do { close_conn($id, 1); return; };
 		} else {
 			deny($id, $type);
 			return;
 		}
 	}
+}
+
+# sign_failed <理由>  署名の失敗を数え、直近 $SIGN_FAIL_WINDOW 秒で $SIGN_FAIL_MAX 回、
+# または累計 $SIGN_FAIL_TOTAL 回に達したら中継を終える
+sub sign_failed {
+	my ($why) = @_;
+	my $now = time;
+	@sign_fail = grep { $now - $_ < $SIGN_FAIL_WINDOW } @sign_fail;
+	push @sign_fail, $now;
+	$sign_fail_total++;
+	audit("deny(relay:sign-failed;$why;" . scalar(@sign_fail) . "/$SIGN_FAIL_MAX in ${SIGN_FAIL_WINDOW}s;total $sign_fail_total/$SIGN_FAIL_TOTAL)");
+	if (@sign_fail >= $SIGN_FAIL_MAX || $sign_fail_total >= $SIGN_FAIL_TOTAL) {
+		audit("deny(relay:sign-failed-too-often;relay-stopped)");
+		$done->();
+	}
+}
+
+# watch_responses <番号> <データ>  専用 ssh-agent の応答を読み、確認ダイアログが出た署名 (13) の失敗 (5) を数える
+# (転送は呼び出し元がそのまま行う。ここでは読むだけ)
+sub watch_responses {
+	my ($id, $b) = @_;
+	return unless exists $resp{$id};
+	$resp{$id} .= $b;
+	my $answered13 = 0;
+	while (length($resp{$id}) >= 4) {
+		my $len = unpack('N', $resp{$id});
+		# 専用 ssh-agent が壊れた応答を返すことは無いはずだが、念のため中継を終える (数えられない状態で続けない)
+		if ($len < 1 || $len > $MAX) { audit("deny(relay:bad-agent-response;relay-stopped)"); $done->(); }
+		last if length($resp{$id}) < 4 + $len;
+		my $rtype = ord(substr($resp{$id}, 4, 1));
+		substr($resp{$id}, 0, 4 + $len, '');
+		my $qtype = length($pend{$id}) ? ord(substr($pend{$id}, 0, 1, '')) : 0;
+		if ($qtype == 27) {
+			$bound{$id} = 1 if $rtype == 6;    # session-bind の成功 (SSH_AGENT_SUCCESS)
+		} elsif ($qtype == 13) {
+			my $t0 = shift @{$sent13{$id}};
+			$answered13 = 1;
+			next unless $rtype == 5;
+			# 接続先に縛った鍵は、session-bind の無い接続ではダイアログを出す前に断られる (ダイアログの出ない失敗は数えない)
+			if ($bound{$id}) { sign_failed('refused'); }
+			elsif (Time::HiRes::time() - $t0 >= $SIGN_SLOW) { sign_failed('refused-unbound'); }
+		}
+	}
+	# 数え終わってから、待たせている署名の要求を送る
+	release13() if $answered13 && defined $inflight13 && $inflight13 == $id;
 }
 
 while (1) {
@@ -161,6 +260,9 @@ while (1) {
 					$conn{$id} = $c;
 					$id_of{fileno $c} = $id;
 					$req{$id} = '';
+					$pend{$id} = '';
+					$resp{$id} = '';
+					$sent13{$id} = [];
 					$sel->add($c);
 				}
 				elsif ($t eq 'D') {
@@ -183,7 +285,7 @@ while (1) {
 			my $n = sysread($fh, my $b, 65536);
 			if (!defined $n) { next if $! == EAGAIN || $! == EWOULDBLOCK || $! == EINTR; close_conn($id, 1); }
 			elsif ($n == 0) { close_conn($id, 1); }
-			else { send_frame('D', $id, $b); }
+			else { send_frame('D', $id, $b); watch_responses($id, $b); }
 		}
 	}
 }

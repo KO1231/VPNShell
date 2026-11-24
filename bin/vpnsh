@@ -420,7 +420,7 @@ EOF
 	trap - HUP TERM INT
 	# 中継が先に終わっていた (= コンテナ側が中継の切断でシェルを閉じた) なら、理由を表示する
 	if [ -n "$with_ssh" ] && [ -n "$SSH_RELAY_PID" ] && ! kill -0 "$SSH_RELAY_PID" 2>/dev/null && [ "$rc" -ge 128 ]; then
-		vpnsh_warn "SSH の中継が切れたため、シェルを終了しました (もう一度 vpnsh --ssh を実行してください)"
+		vpnsh_warn "SSH の中継が切れたため、シェルを終了しました (SSH 鍵の使用を短い間に何度も拒否・時間切れにした場合も、安全のため中継を止めます。記録は state/ssh-audit.log。もう一度 vpnsh --ssh を実行してください)"
 	fi
 	kill_own_work
 	ssh_relay_stop
