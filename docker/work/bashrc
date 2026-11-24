@@ -1,0 +1,70 @@
+# VPNShell: work コンテナの bash 設定 (/etc/bash.bashrc として置く。root 所有、読み取り専用)
+# ホームにはひな形の .bashrc などを置いていない。
+
+# 対話シェルだけ。同じシェルで二重に読み込まない
+[[ $- == *i* ]] || return 0
+[[ -n "${__VPNSH_BASHRC_LOADED:-}" ]] && return 0
+__VPNSH_BASHRC_LOADED=1
+
+# ~/.local/bin に入れたツールを使えるようにする (ひな形の .profile の代わり)。
+# PATH の「後ろ」に足す: ここに置いた偽の ssh や git が、標準のものより優先されないように
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$PATH:$HOME/.local/bin" ;; esac
+
+# 履歴はファイルに残さない (セッション内の ↑ は使える)
+unset HISTFILE
+HISTSIZE=5000
+HISTCONTROL=ignoreboth
+
+# shellcheck source=/dev/null
+[ -r /usr/share/bash-completion/bash_completion ] && . /usr/share/bash-completion/bash_completion
+
+VPNSH_PUBLIC_IP=""
+[ -r /tmp/vpnsh/state ] && VPNSH_PUBLIC_IP="$(sed -n 's/^PUBLIC_IP=//p' /tmp/vpnsh/state)"
+# 表示に使う値は IPv4 の形のものだけ (プロンプトでコマンドとして展開されないように)
+[[ "$VPNSH_PUBLIC_IP" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || VPNSH_PUBLIC_IP="?"
+readonly VPNSH_PUBLIC_IP
+
+# マウントの表示 (vpnsh -m / --mount-cwd-rw のとき)。値は形を確かめてから使う
+VPNSH_MOUNT_LABEL=""
+if [[ "${VPNSH_MOUNT:-}" == ro || "${VPNSH_MOUNT:-}" == rw ]]; then
+	__d="${VPNSH_MOUNT_DISPLAY:-?}"
+	[[ "$__d" =~ ^[A-Za-z0-9._~/+@\ ?-]{1,120}$ ]] || __d="?"
+	VPNSH_MOUNT_LABEL="/work=${__d} (${VPNSH_MOUNT}) "
+	unset __d
+	if [[ "$VPNSH_MOUNT" == rw ]]; then
+		printf '\033[33mvpnsh: /work は読み書き可能です。.git/config・.git/hooks・.envrc・.vscode などを書き換えると、Mac 上で実行され得ます\033[0m\n' >&2
+	fi
+fi
+readonly VPNSH_MOUNT_LABEL
+
+# ターミナルのタイトル
+printf '\033]0;VPN %s\007' "$VPNSH_PUBLIC_IP"
+
+# プロンプトを表示するたびに、gluetun との接続状態を確認する (bash の組み込み機能だけなので軽い)
+#   eth0 が無い → gluetun が作り直された (この名前空間には二度と通信が戻らない)
+#   tun0 が無い → VPN 再接続中 (遮断は効いている)
+# (トンネルはあるのに通信できない状態は、Mac 側の vpnsh が監視して端末に直接知らせる。lib/netmon.sh)
+# PS1 は固定の文字列にし、値は表示のときに変数として展開させる
+# (値を PS1 に直接埋め込むと、値の中の $(...) がコマンドとして実行され得るため)
+__vpnsh_prompt() {
+	local rc=$?
+	if [[ ! -e /sys/class/net/eth0 ]]; then
+		VPNSH_STATUS_COLOR=$'\033[41;97m'
+		VPNSH_STATUS_TEXT='[gluetun が作り直されました。exit して vpnsh を再実行してください] '
+	elif [[ ! -e /sys/class/net/tun0 ]]; then
+		VPNSH_STATUS_COLOR=$'\033[43;30m'
+		VPNSH_STATUS_TEXT='[VPN 再接続中 (遮断は有効)] '
+	else
+		VPNSH_STATUS_COLOR=""
+		VPNSH_STATUS_TEXT=""
+	fi
+	VPNSH_MARK='$'
+	[[ $rc -ne 0 ]] && VPNSH_MARK="[$rc]\$"
+	return 0
+}
+PROMPT_COMMAND=__vpnsh_prompt
+PS1='\[${VPNSH_STATUS_COLOR}\]${VPNSH_STATUS_TEXT}\[\e[0m\]\[\e[1;42;30m\] VPN ${VPNSH_PUBLIC_IP} \[\e[0m\] \[\e[35m\]${VPNSH_MOUNT_LABEL}\[\e[0m\]\[\e[36m\]\w\[\e[0m\] ${VPNSH_MARK} '
+
+alias ls='ls --color=auto'
+alias ll='ls -alF'
+alias grep='grep --color=auto'

@@ -1,0 +1,7 @@
+# shellcheck はリポジトリ直下で実行する:
+#   docker run --rm -e LANG=C.UTF-8 -e LC_ALL=C.UTF-8 -v "$PWD:/mnt:ro" -w /mnt koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d -f gcc -x \
+#     bin/vpnsh lib/*.sh tests/*.sh docker/work/*.sh docker/work/bashrc
+# (LANG と LC_ALL を C.UTF-8 にしないと、日本語を含む行で誤ってパースエラーになる)
+external-sources=true
+# 単一引用符内の $ はコンテナ内のシェルや docker のテンプレートに渡すためのもの
+disable=SC2016

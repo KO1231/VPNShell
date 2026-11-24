@@ -1,0 +1,21 @@
+# work コンテナに入れるパッケージ (1行に1つ。# 以降はコメント)
+# 個人用の追加は同じディレクトリの packages.local.txt に書く (gitignore 対象)。変更後は `vpnsh build`
+
+# 基本
+ca-certificates
+curl
+wget
+dnsutils
+iputils-ping
+netcat-openbsd
+jq
+git
+vim
+openssh-client
+
+# 切り分け・使い勝手
+iproute2
+less
+procps
+bash-completion
+tzdata

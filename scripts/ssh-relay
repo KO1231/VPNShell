@@ -1,0 +1,189 @@
+#!/usr/bin/perl
+# VPNShell: SSH エージェント中継の Mac 側
+#
+#   ssh-relay <コンテナID> <専用 ssh-agent のソケット> <docker context> [記録ファイル]
+#
+# docker exec -i でコンテナ側の中継 (/usr/local/lib/vpnsh/ssh-relay) を起動し、その標準入出力を
+# 1本のストリームとして使う。コンテナ側で ssh が接続するたびに「開く」の枠が来るので、
+# そのたびに専用 ssh-agent へ新しく接続する (1対1)。
+#
+# コンテナから専用 ssh-agent へ通す要求は、ssh が認証に使う3種類だけに絞る:
+#   11 鍵の一覧 / 13 署名 / 27 拡張のうち session-bind@openssh.com (接続先に縛った鍵 (-h) に必要)
+# それ以外 (鍵の追加・削除・ロック・スマートカードなど) は専用 ssh-agent に届けず、失敗 (5) を返してその接続を閉じる
+# (普段の ssh / git はこれらを送らない)。拒否の記録は、送り続けて Mac のディスクを埋められないよう件数を絞り、
+# 拒否が多すぎるときは中継を終える (シェルも閉じる)。
+# (コンテナ内のコードが自分の鍵を追加して確認ダイアログや記録を偽装したり、鍵を消したり
+#  ロックしたりするのを防ぐ)。承認の判断は ssh-agent の -c と確認ダイアログが行う。
+# docker exec は対象のコンテナにしか届かないので、ネットワークの遮断ルールに穴を開けない。
+# 枠の形式は docker/work/ssh-relay を参照。
+use strict;
+use warnings;
+no warnings 'uninitialized';
+use IO::Socket::UNIX;
+use IO::Select;
+use IPC::Open2;
+use Socket qw(SOCK_STREAM);
+use Errno qw(EAGAIN EWOULDBLOCK EINTR);
+use POSIX qw(strftime);
+
+my ($cid, $agent, $context, $audit) = @ARGV;
+die "usage: ssh-relay <container> <agent-socket> <context> [audit-log]\n" unless $cid && $agent && $context;
+die "ssh-relay: bad container id\n" unless $cid =~ /\A[0-9a-f]{12,64}\z/;
+die "ssh-relay: bad context\n" unless $context =~ /\A[A-Za-z0-9._-]+\z/;
+my $MAX = 262144;         # ssh-agent のメッセージの上限 (256KiB)
+my $MAX_CONN = 32;        # 1シェルあたりの同時接続数の上限
+my $WRITE_TIMEOUT = 10;
+my %ALLOW = (11 => 1, 13 => 1);    # 27 (拡張) は名前を見て判断する
+my $LOG_FIRST = 10;       # 1本の中継で、拒否を1件ずつ記録する件数 (それ以降はまとめる)
+my $LOG_EVERY = 60;       # まとめた件数を記録する間隔 (秒)
+my $DENY_MAX = 1000;      # 1本の中継で拒否がこれを超えたら、中継を終える
+my $AUDIT_MAX = 1048576;  # 記録ファイルがこれを超えたら、1世代だけ残して入れ替える
+my ($denied, $suppressed, $last_summary) = (0, 0, time);
+my $SESSION_BIND = 'session-bind@openssh.com';
+
+# docker exec の stderr (コンテナ側の警告など) は端末に出さない
+open(STDERR, '>', '/dev/null');
+my $pid = open2(my $from, my $to, 'docker', '--context', $context,
+	'exec', '-i', $cid, '/usr/local/lib/vpnsh/ssh-relay')
+	or exit 1;
+binmode $from;
+binmode $to;
+$SIG{PIPE} = 'IGNORE';
+my $done = sub { kill 'TERM', $pid; exit 0; };
+$SIG{TERM} = $done;
+$SIG{HUP} = $done;
+$SIG{INT} = $done;
+
+my $sel = IO::Select->new($from);
+my (%conn, %id_of, %req);    # %req: 接続ごとの、コンテナから来た未処理のバイト列
+my $inbuf = '';
+
+sub audit {
+	return unless $audit;
+	my @st = stat($audit);
+	rename($audit, "$audit.1") if @st && $st[7] > $AUDIT_MAX;
+	if (open(my $fh, '>>', $audit)) {
+		printf $fh "%s\t%s\t-\t-\n", strftime('%Y-%m-%dT%H:%M:%SZ', gmtime), $_[0];
+		close $fh;
+	}
+}
+sub write_all {
+	my ($fh, $buf) = @_;
+	my $ws = IO::Select->new($fh);
+	while (length $buf) {
+		return 0 unless $ws->can_write($WRITE_TIMEOUT);
+		my $n = syswrite($fh, $buf);
+		if (!defined $n) { next if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK; return 0; }
+		substr($buf, 0, $n, '');
+	}
+	return 1;
+}
+sub send_frame {
+	my ($t, $id, $d) = @_;
+	$d = '' unless defined $d;
+	write_all($to, pack('a1NN', $t, $id, length $d) . $d) or $done->();
+}
+sub close_conn {
+	my ($id, $notify) = @_;
+	delete $req{$id};
+	my $c = delete $conn{$id} or return;
+	delete $id_of{fileno $c} if defined fileno $c;
+	$sel->remove($c);
+	close $c;
+	send_frame('C', $id) if $notify;
+}
+
+# deny <番号> <種類>  失敗 (SSH_AGENT_FAILURE) を返してその接続を閉じ、件数を絞って記録する
+sub deny {
+	my ($id, $type) = @_;
+	send_frame('D', $id, pack('NC', 1, 5));
+	close_conn($id, 1);
+	$denied++;
+	if ($denied <= $LOG_FIRST) {
+		audit("deny(relay:type=$type)");
+	} else {
+		$suppressed++;
+		if (time - $last_summary >= $LOG_EVERY) {
+			audit("deny(relay:$suppressed more)");
+			($suppressed, $last_summary) = (0, time);
+		}
+	}
+	if ($denied > $DENY_MAX) {
+		audit("deny(relay:too-many;" . ($suppressed ? "$suppressed more;" : "") . "relay-stopped)");
+		$done->();
+	}
+}
+
+# filter_requests <番号>  溜まったバイト列から完全なメッセージを取り出し、許可するものだけ専用 ssh-agent へ送る
+sub filter_requests {
+	my ($id) = @_;
+	my $c = $conn{$id} or return;
+	while (length($req{$id}) >= 4) {
+		my $len = unpack('N', $req{$id});
+		if ($len < 1 || $len > $MAX) { close_conn($id, 1); return; }
+		last if length($req{$id}) < 4 + $len;
+		my $msg = substr($req{$id}, 0, 4 + $len, '');
+		my $type = ord(substr($msg, 4, 1));
+		my $ok = $ALLOW{$type};
+		if (!$ok && $type == 27 && $len >= 5) {
+			my $nlen = unpack('N', substr($msg, 5, 4));
+			$ok = 1 if $nlen == length($SESSION_BIND) && substr($msg, 9, $nlen) eq $SESSION_BIND;
+		}
+		if ($ok) {
+			write_all($c, $msg) or do { close_conn($id, 1); return; };
+		} else {
+			deny($id, $type);
+			return;
+		}
+	}
+}
+
+while (1) {
+	for my $fh ($sel->can_read) {
+		next unless defined fileno $fh;
+		if ($fh == $from) {
+			my $n = sysread($from, my $b, 65536);
+			$done->() unless $n;
+			$inbuf .= $b;
+			while (length($inbuf) >= 9) {
+				my ($t, $id, $len) = unpack('a1NN', $inbuf);
+				$done->() if $len > $MAX;
+				last if length($inbuf) < 9 + $len;
+				my $d = substr($inbuf, 9, $len);
+				substr($inbuf, 0, 9 + $len, '');
+				if ($t eq 'O') {
+					# 同じ番号が2回来るのは異常なので中継を終える
+					$done->() if exists $conn{$id};
+					if (keys(%conn) >= $MAX_CONN) { send_frame('C', $id); next; }
+					my $c = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $agent);
+					if (!$c) { send_frame('C', $id); next; }
+					$c->blocking(0);
+					$conn{$id} = $c;
+					$id_of{fileno $c} = $id;
+					$req{$id} = '';
+					$sel->add($c);
+				}
+				elsif ($t eq 'D') {
+					next unless $conn{$id};
+					$req{$id} .= $d;
+					if (length($req{$id}) > $MAX + 4) { close_conn($id, 1); next; }
+					filter_requests($id);
+				}
+				elsif ($t eq 'C') {
+					close_conn($id, 0);
+				}
+				else {
+					$done->();
+				}
+			}
+		}
+		else {
+			my $id = $id_of{fileno $fh};
+			next unless defined $id;
+			my $n = sysread($fh, my $b, 65536);
+			if (!defined $n) { next if $! == EAGAIN || $! == EWOULDBLOCK || $! == EINTR; close_conn($id, 1); }
+			elsif ($n == 0) { close_conn($id, 1); }
+			else { send_frame('D', $id, $b); }
+		}
+	}
+}

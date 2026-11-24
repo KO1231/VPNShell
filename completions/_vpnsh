@@ -1,0 +1,143 @@
+#compdef vpnsh
+# vpnsh の zsh 補完
+#
+# 使い方: vpnsh install-shell を実行すると、~/.zshrc に PATH とこの補完の設定が追記されます
+
+_vpnsh() {
+	local curcontext="$curcontext" state line ret=1
+	typeset -A opt_args
+
+	# 一覧の変数名を commands にしないこと: zsh の特別な連想配列 $commands (コマンド名 → パス) が隠れ、
+	# _vpnsh_hosts が vpnsh の場所を見つけられなくなる
+	local -a vpnsh_cmds
+	vpnsh_cmds=(
+		'shell:固定IPのシェルに入る (既定)'
+		'run:起動前チェックのあとコマンドを1回実行する'
+		'check:起動前チェックだけ実行する (--full: 漏れの実地検査 / --mtu: MTU の診断)'
+		'setup:初回セットアップ (NordVPN の WireGuard .conf を取り込む)'
+		'up:gluetun を起動する (.env の変更を適用する)'
+		'down:gluetun を停止して破棄する'
+		'restart:gluetun を再起動する'
+		'status:状態を表示する'
+		'ps:開いているシェルの一覧'
+		'gc:持ち主のいないシェルを片付ける'
+		'logs:gluetun のログ'
+		'build:work イメージをビルドする'
+		'ssh:専用 ssh-agent の操作 (add / list / stop)'
+		'trust-host:接続先のホスト鍵を確認して保存する'
+		'install-shell:~/.zshrc に PATH と補完の設定を追記する'
+		'config:設定の一覧と変更'
+		'doctor:設定や状態を一括で点検する'
+		'help:使い方を表示する'
+		'version:バージョンを表示する'
+	)
+
+	_arguments -C -s \
+		'(-m --mount-cwd --mount-cwd-rw)'{-m,--mount-cwd}'[カレントディレクトリを /work に読み取り専用でマウントする]' \
+		'(-m --mount-cwd --mount-cwd-rw)--mount-cwd-rw[カレントディレクトリを /work に読み書き可能でマウントする]' \
+		'--ssh[SSH を使えるようにする (専用 ssh-agent に中継する)]' \
+		'(-v --verbose)'{-v,--verbose}'[チェックごとの結果などを表示する]' \
+		'--timing[起動までの段階ごとの所要時間を表示する]' \
+		'(-y --yes)'{-y,--yes}'[確認をすべて「はい」で進める]' \
+		'(- *)'{-h,--help}'[使い方を表示する]' \
+		'(- *)--version[バージョンを表示する]' \
+		'1: :->command' \
+		'*:: :->args' && ret=0
+
+	case $state in
+		command)
+			_describe -t commands 'vpnsh のコマンド' vpnsh_cmds && ret=0
+			;;
+		args)
+			case $words[1] in
+				run)
+					# vpnsh run [--] <コマンド> [引数...]
+					[[ $words[2] == -- ]] && { shift words; (( CURRENT-- )); }
+					shift words; (( CURRENT-- ))
+					_normal && ret=0
+					;;
+				setup)
+					_arguments \
+						'--import[NordVPN の WireGuard 設定ファイル]:設定ファイル:_files -g "*.conf(-.)"' && ret=0
+					;;
+				up)
+					_arguments '--recreate[gluetun を必ず作り直す]' && ret=0
+					;;
+				check)
+					_arguments '(--mtu)--full[漏れの実地検査 (VPN を通らない経路に送って、届かないことを確かめる)]' '(--full)--mtu[MTU の診断]' && ret=0
+					;;
+				ssh)
+					if (( CURRENT == 2 )); then
+						local -a subs
+						subs=('host:接続先の追加・取り除き' 'add:鍵をメモリに読み込む (8時間)' 'list:メモリにある鍵 (-a で登録した接続先すべて)' 'stop:専用 ssh-agent を止める')
+						_describe -t subcommands 'ssh のコマンド' subs && ret=0
+					elif [[ $words[2] == add ]]; then
+						_vpnsh_hosts && ret=0
+					elif [[ $words[2] == list ]]; then
+						_arguments '(-a --all)'{-a,--all}'[登録した接続先をすべて表示する (メモリにない鍵も含む)]' && ret=0
+					elif [[ $words[2] == host ]]; then
+						if (( CURRENT == 3 )); then
+							local -a hsubs
+							hsubs=('add:~/.ssh/config の Host から追加する' 'remove:接続先を取り除く')
+							_describe -t subcommands 'host のコマンド' hsubs && ret=0
+						elif (( CURRENT == 4 )) && [[ $words[3] == add ]]; then
+							_vpnsh_ssh_config_hosts && ret=0
+						elif (( CURRENT == 4 )) && [[ $words[3] == remove ]]; then
+							_vpnsh_hosts && ret=0
+						fi
+					fi
+					;;
+				config)
+					if (( CURRENT == 2 )); then
+						local -a csubs
+						csubs=('list:設定の一覧' 'set:設定を変える')
+						_describe -t subcommands 'config のコマンド' csubs && ret=0
+					elif (( CURRENT == 3 )) && [[ $words[2] == set ]]; then
+						local -a keys
+						keys=('ssh-control-master:同じサーバーへの接続を使い回す (on|off)' 'mtu:MTU (1280〜1420)' 'idle-down:使わないときに gluetun を自動で破棄する (時間|off)' 'mount-root:-m でマウントできる場所 (ホームの中のディレクトリ)')
+						_describe -t keys '項目' keys && ret=0
+					elif (( CURRENT == 4 )) && [[ $words[3] == ssh-control-master ]]; then
+						compadd on off && ret=0
+					elif (( CURRENT == 4 )) && [[ $words[3] == mount-root ]]; then
+						_files -/ && ret=0
+					elif (( CURRENT == 4 )) && [[ $words[3] == idle-down ]]; then
+						compadd 1h 4h 8h 1d off && ret=0
+					fi
+					;;
+				trust-host)
+					(( CURRENT == 2 )) && _vpnsh_hosts && ret=0
+					;;
+				logs)
+					_arguments \
+						'(-f --follow)'{-f,--follow}'[ログを追い続ける]' \
+						'(-n --tail)'{-n,--tail}'[末尾から表示する行数]:行数' \
+						'(-t --timestamps)'{-t,--timestamps}'[時刻を表示する]' \
+						'--since[この時刻以降]:時刻' && ret=0
+					;;
+			esac
+			;;
+	esac
+	return ret
+}
+
+# state/hosts の名前を候補にする
+_vpnsh_hosts() {
+	local vpnsh_bin root
+	vpnsh_bin="${commands[vpnsh]:A}"
+	[[ -n $vpnsh_bin ]] || return 1
+	root="${vpnsh_bin:h:h}"
+	[[ -r $root/state/hosts ]] || return 1
+	local -a names
+	names=(${(f)"$(awk '!/^[[:space:]]*(#|$)/ { print $1 }' "$root/state/hosts")"})
+	compadd -a names
+}
+
+# ~/.ssh/config の Host 名 (ワイルドカードを含むものは除く)
+_vpnsh_ssh_config_hosts() {
+	[[ -r ~/.ssh/config ]] || return 1
+	local -a names
+	names=(${(f)"$(awk 'tolower($1) == "host" { for (i = 2; i <= NF; i++) if ($i !~ /[*?!]/) print $i }' ~/.ssh/config)"})
+	compadd -a names
+}
+
+_vpnsh "$@"

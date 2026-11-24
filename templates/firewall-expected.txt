@@ -1,0 +1,109 @@
+# gluetun (v3.41.3, custom / WireGuard, カーネル実装) のファイアウォールとルーティングの期待値
+#
+# - "## <名前>" はセクション (lib/fwcheck.sh の fw_dump の出力に対応)
+# - 行頭が "= " の行は、そのチェーンの先頭に「この順序で」あること (VPNShell の post-rules)
+# - それ以外の行は集合として比べる (順序は問わないが、過不足は許さない)
+# - @@...@@ は毎回変わる値で、実際の値を正規化してから比べる
+#   ETH0_IP / ETH0_SUBNET / ETH0_BCAST / ETH0_GW: gluetun の eth0、ENDPOINT_*: VPN エンドポイント、
+#   WG_ADDR: WireGuard のアドレス (.env の WIREGUARD_ADDRESSES)、PORT: Docker 組み込み DNS の DNAT
+#
+# 更新の手順 (gluetun を更新したとき、または実機で差分が出たとき):
+#   1. tests/firewall-test.sh --dump で正規化した実際の値を出す
+#   2. 差分の1行ずつについて、通信を広げるもの (ACCEPT の追加、DROP の削除、ルーティングの追加) でないか確かめる
+#   3. 理由が分かったものだけを反映する。分からない差分を「期待値を緩めて」通さないこと
+
+## filter
+-P INPUT DROP
+-P FORWARD DROP
+-P OUTPUT DROP
+= -A INPUT ! -s @@ENDPOINT_IP@@/32 -i eth0 -j DROP
+= -A INPUT -i eth0 -m conntrack ! --ctstate RELATED,ESTABLISHED -j DROP
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -d @@ETH0_SUBNET@@ -i eth0 -j ACCEPT
+= -A OUTPUT -d 127.0.0.11/32 -j REJECT --reject-with icmp-port-unreachable
+= -A OUTPUT -d @@ENDPOINT_IP@@/32 -o eth0 -p udp -m udp --dport @@ENDPOINT_PORT@@ -m mark --mark 0xca6c -j ACCEPT
+= -A OUTPUT -o eth0 -j DROP
+-A OUTPUT -o lo -j ACCEPT
+-A OUTPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A OUTPUT -s @@ETH0_IP@@/32 -d @@ETH0_SUBNET@@ -o eth0 -j ACCEPT
+-A OUTPUT -d @@ENDPOINT_IP@@/32 -o eth0 -p udp -m udp --dport @@ENDPOINT_PORT@@ -j ACCEPT
+-A OUTPUT -o tun0 -j ACCEPT
+
+## nat
+-P PREROUTING ACCEPT
+-P INPUT ACCEPT
+-P OUTPUT ACCEPT
+-P POSTROUTING ACCEPT
+-N DOCKER_OUTPUT
+-N DOCKER_POSTROUTING
+-A OUTPUT -d 127.0.0.11/32 -j DOCKER_OUTPUT
+-A POSTROUTING -d 127.0.0.11/32 -j DOCKER_POSTROUTING
+-A DOCKER_OUTPUT -d 127.0.0.11/32 -p tcp -m tcp --dport 53 -j DNAT --to-destination 127.0.0.11:@@PORT@@
+-A DOCKER_OUTPUT -d 127.0.0.11/32 -p udp -m udp --dport 53 -j DNAT --to-destination 127.0.0.11:@@PORT@@
+-A DOCKER_POSTROUTING -s 127.0.0.11/32 -p tcp -m tcp --sport @@PORT@@ -j SNAT --to-source :53
+-A DOCKER_POSTROUTING -s 127.0.0.11/32 -p udp -m udp --sport @@PORT@@ -j SNAT --to-source :53
+
+## mangle
+-P PREROUTING ACCEPT
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+-P POSTROUTING ACCEPT
+
+## raw
+-P PREROUTING ACCEPT
+-P OUTPUT ACCEPT
+
+## filter6
+-P INPUT DROP
+-P FORWARD DROP
+-P OUTPUT DROP
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A OUTPUT -o lo -j ACCEPT
+-A OUTPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A OUTPUT -d ff02::1:ff00:0/104 -o eth0 -j ACCEPT
+-A OUTPUT -o tun0 -j ACCEPT
+
+## legacy
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+
+## legacy-nat
+-P PREROUTING ACCEPT
+-P INPUT ACCEPT
+-P OUTPUT ACCEPT
+-P POSTROUTING ACCEPT
+
+## legacy6
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+
+## rule4
+0:	from all lookup local
+98:	from all to @@ETH0_SUBNET@@ lookup main
+100:	from @@ETH0_IP@@ lookup 200
+101:	not from all fwmark 0xca6c lookup 51820
+32766:	from all lookup main
+32767:	from all lookup default
+
+## route4
+default dev tun0 table 51820
+default via @@ETH0_GW@@ dev eth0 table 200
+default via @@ETH0_GW@@ dev eth0
+@@ETH0_SUBNET@@ dev eth0 proto kernel scope link src @@ETH0_IP@@
+local @@WG_ADDR@@ dev tun0 table local proto kernel scope host src @@WG_ADDR@@
+local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1
+local 127.0.0.1 dev lo table local proto kernel scope host src 127.0.0.1
+broadcast 127.255.255.255 dev lo table local proto kernel scope link src 127.0.0.1
+local @@ETH0_IP@@ dev eth0 table local proto kernel scope host src @@ETH0_IP@@
+broadcast @@ETH0_BCAST@@ dev eth0 table local proto kernel scope link src @@ETH0_IP@@
+
+## rule6
+0:	from all lookup local
+32766:	from all lookup main
+
+## route6

@@ -1,0 +1,8 @@
+# 機密・環境依存
+.env
+*.conf
+# 秘密を含まないテンプレートだけは管理する
+!templates/work-resolv.conf
+state/
+# 個人用の追加パッケージ
+docker/work/packages.local.txt

@@ -1,0 +1,169 @@
+#!/bin/bash
+# VPNShell: 固定しているイメージ (gluetun、ubuntu) の新しい版を確かめ、承認したら compose.yaml を書き換える
+#
+#   scripts/update-pins           確かめて、新しい版があれば書き換えるか聞く
+#   scripts/update-pins --check   確かめるだけ (新しい版があれば終了コード 1)
+#
+# 調べる先: GitHub の gluetun のリリース (最新の安定版のタグ)、Docker Hub (マルチアーキテクチャのインデックスのダイジェスト)。
+# gluetun を更新したときは、新しい版の遮断ルール・ルーティングと期待値 (templates/firewall-expected.txt) の差分を出す。
+# 期待値は自動では書き換えない (差分の1行ずつを人が確かめ、通信を広げるもの (ACCEPT の追加、DROP の削除、ルーティングの追加) でないことを確認する)
+# shellcheck disable=SC2015  # A && B || die の die は終了するので、if-then-else と同じに動く
+set -u
+umask 077
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+COMPOSE="$ROOT/compose.yaml"
+MODE="${1:-}"
+case "$MODE" in "" | --check) ;; *) echo "使い方: scripts/update-pins [--check]" >&2; exit 2 ;; esac
+CONTEXT="orbstack"
+
+info() { printf 'update-pins: %s\n' "$*" >&2; }
+die() { printf 'update-pins: エラー: %s\n' "$*" >&2; exit 1; }
+
+# 今の固定値
+cur_gl_ref="$(sed -n 's/^[[:space:]]*image:[[:space:]]*\(qmcgaw\/gluetun:[^[:space:]]*\)[[:space:]]*$/\1/p' "$COMPOSE" | head -n 1)"
+cur_ub_ref="$(sed -n 's/^[[:space:]]*BASE_IMAGE:[[:space:]]*\(ubuntu:[^[:space:]]*\)[[:space:]]*$/\1/p' "$COMPOSE" | head -n 1)"
+[ -n "$cur_gl_ref" ] && [ -n "$cur_ub_ref" ] || die "compose.yaml から今の固定値を読み取れません"
+cur_gl_tag="${cur_gl_ref%%@*}"; cur_gl_tag="${cur_gl_tag#*:}"
+cur_ub_tag="${cur_ub_ref%%@*}"; cur_ub_tag="${cur_ub_tag#*:}"
+
+# index_digest <イメージ:タグ>  マルチアーキテクチャのインデックスのダイジェスト (arm64 と amd64 を含むこと)
+index_digest() {
+	command docker --context "$CONTEXT" buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null | perl -MJSON::PP -e '
+		local $/; my $m = eval { decode_json(<STDIN>) } or exit 1;
+		my %arch = map { ($_->{platform}{architecture} // "") => 1 } @{ $m->{manifests} // [] };
+		exit 2 unless $arch{arm64} && $arch{amd64};
+		print $m->{digest} if ($m->{digest} // "") =~ /\Asha256:[0-9a-f]{64}\z/;
+	'
+}
+
+# gluetun の GitHub のリポジトリ。2026-11 に qdm12/gluetun から移動した (利用者が正当と確認。README に
+# qdm12 と Docker Hub の qmcgaw/gluetun が書かれていることも確認)。ここからさらに移動していれば警告する
+GL_REPO="passteque/gluetun"
+gh_api() { curl -fsSL --max-time 15 -H 'Accept: application/vnd.github+json' "https://api.github.com/$1"; }
+info "gluetun の最新の安定版を GitHub で確認しています"
+# リポジトリが移動 (所有者が変更) されていないか。移動していれば、配布元のすり替えではないか人が確かめる
+repo_now="$(gh_api "repos/$GL_REPO" | perl -MJSON::PP -e 'local $/; my $r = eval { decode_json(<STDIN>) } or exit 1; print $r->{full_name} // ""')"
+[ -n "$repo_now" ] || die "GitHub から $GL_REPO の情報を取得できません"
+REPO_MOVED=""
+if [ "$repo_now" != "$GL_REPO" ]; then
+	REPO_MOVED=1
+	printf 'update-pins: \033[33m警告:\033[0m gluetun のリポジトリが %s から %s に移動しています (所有者の変更)。\n' "$GL_REPO" "$repo_now" >&2
+	printf 'update-pins:        正当な移動か (作者の告知など) を確かめてから更新してください。Docker Hub のイメージ名 (qmcgaw/gluetun) は変わっていません\n' >&2
+fi
+latest_gl_tag="$(gh_api "repos/$repo_now/releases/latest" |
+	perl -MJSON::PP -e 'local $/; my $r = eval { decode_json(<STDIN>) } or exit 1; print $r->{prerelease} ? "" : ($r->{tag_name} // "")')"
+printf '%s' "$latest_gl_tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || die "gluetun の最新版のタグを取得できません (${latest_gl_tag:-応答なし})"
+info "ダイジェストを Docker Hub で確認しています"
+new_gl_digest="$(index_digest "qmcgaw/gluetun:$latest_gl_tag")" && [ -n "$new_gl_digest" ] || die "qmcgaw/gluetun:$latest_gl_tag のダイジェストを取得できません (arm64 と amd64 を含むインデックスであること)"
+new_ub_digest="$(index_digest "ubuntu:$cur_ub_tag")" && [ -n "$new_ub_digest" ] || die "ubuntu:$cur_ub_tag のダイジェストを取得できません"
+new_gl_ref="qmcgaw/gluetun:$latest_gl_tag@$new_gl_digest"
+new_ub_ref="ubuntu:$cur_ub_tag@$new_ub_digest"
+
+echo
+printf '  %-8s %-14s %s\n' "" "今" "最新"
+printf '  %-8s %-14s %s\n' "gluetun" "$cur_gl_tag" "$latest_gl_tag"
+c="${cur_gl_ref##*@sha256:}"; n="${new_gl_digest#sha256:}"
+printf '  %-8s %-14s %s\n' "" "${c:0:12}…" "${n:0:12}…"
+printf '  %-8s %-14s %s\n' "ubuntu" "$cur_ub_tag" "$cur_ub_tag"
+c="${cur_ub_ref##*@sha256:}"; n="${new_ub_digest#sha256:}"
+printf '  %-8s %-14s %s\n' "" "${c:0:12}…" "${n:0:12}…"
+echo
+
+changed_gl=""; changed_ub=""
+[ "$cur_gl_ref" != "$new_gl_ref" ] && changed_gl=1
+[ "$cur_ub_ref" != "$new_ub_ref" ] && changed_ub=1
+if [ -z "$changed_gl$changed_ub" ]; then
+	info "どちらも最新です"
+	exit 0
+fi
+[ -n "$changed_gl" ] && info "gluetun $latest_gl_tag のリリースノート: https://github.com/$repo_now/releases/tag/$latest_gl_tag"
+[ -n "$changed_ub" ] && info "ubuntu:$cur_ub_tag は同じタグのまま更新されています (セキュリティ修正など)"
+[ "$MODE" = "--check" ] && exit 1
+
+[ -r /dev/tty ] || die "書き換えの確認には端末が必要です"
+if [ -n "$REPO_MOVED" ] && [ -n "$changed_gl" ]; then
+	printf 'update-pins: リポジトリの移動を確かめましたか? 確かめたなら yes と入力してください: ' >&2
+	IFS= read -r ans </dev/tty || exit 1
+	[ "$ans" = "yes" ] || { info "書き換えませんでした"; exit 0; }
+fi
+
+# 表示する差分は制御文字を見える形にする (細工したイメージがエスケープシーケンスで行を隠せないように)
+show() { perl -pe 's/([\x00-\x08\x0b-\x1f\x7f])/"^" . chr(ord($1) ^ 64)/ge; s/^/    /' >&2; }
+
+# 判断の材料 (差分) を先に見せてから、書き換えるかを聞く。
+# 遮断ルールを取得するには compose.yaml を新しい値にしておく必要があるので、元のファイルを控えてから仮に書き換え、
+# 「やめる」なら元に戻す
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/vpnsh-pins.XXXXXX")"
+cp -p "$COMPOSE" "$WORKDIR/compose.yaml.orig" || die "compose.yaml を控えられません"
+restore() {
+	cp -p "$WORKDIR/compose.yaml.orig" "$COMPOSE" && info "compose.yaml を元に戻しました"
+}
+cleanup() { rm -f "$WORKDIR"/*; rmdir "$WORKDIR" 2>/dev/null; }
+trap 'restore; cleanup; exit 1' INT TERM HUP
+
+OLD_GL="$cur_gl_ref" NEW_GL="$new_gl_ref" OLD_UB="$cur_ub_ref" NEW_UB="$new_ub_ref" perl -0pi -e '
+	s/\Q$ENV{OLD_GL}\E/$ENV{NEW_GL}/ or die "gluetun の行を書き換えられません\n";
+	s/\Q$ENV{OLD_UB}\E/$ENV{NEW_UB}/ or die "ubuntu の行を書き換えられません\n";
+' "$COMPOSE" || { restore; cleanup; die "compose.yaml を書き換えられません"; }
+
+fw_changed=""
+if [ -n "$changed_gl" ]; then
+	info "新しい gluetun を取得しています (Mac の回線から)"
+	command docker --context "$CONTEXT" pull -q "$new_gl_ref" >/dev/null || { restore; cleanup; die "新しい gluetun を取得できません"; }
+	# 既定の環境変数の差分 (キルスイッチなどの既定値が変わっていないか。vpnsh は必須の値を GL_REQUIRED_ENV で検査する)
+	env_of() { command docker --context "$CONTEXT" image inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null | sort; }
+	if command docker --context "$CONTEXT" image inspect "$cur_gl_ref" >/dev/null 2>&1; then
+		d="$(diff <(env_of "$cur_gl_ref") <(env_of "$new_gl_ref"))"
+		if [ -n "$d" ]; then
+			info "イメージの既定の環境変数の差分 (< 今 / > 新しい版):"
+			printf '%s\n' "$d" | grep '^[<>]' | show
+		else
+			info "イメージの既定の環境変数に差分はありません"
+		fi
+	fi
+	info "新しい gluetun の遮断ルール・ルーティングを、実在しない接続先で起動して取得しています (本物の鍵は使いません)"
+	if "$ROOT/tests/firewall-test.sh" --dump >"$WORKDIR/fw" 2>/dev/null && [ -s "$WORKDIR/fw" ]; then
+		d="$(diff "$ROOT/templates/firewall-expected.txt" "$WORKDIR/fw")"
+		if [ -z "$d" ]; then
+			info "遮断ルール・ルーティングは期待値と同じです"
+		else
+			fw_changed=1
+			info "遮断ルール・ルーティングが期待値と違います (< 期待値 / > 新しい版)。1行ずつ、通信を広げるもの (ACCEPT の追加、DROP の削除、ルーティングの追加) でないか確かめてください:"
+			printf '%s\n' "$d" | grep '^[<>]' | show
+		fi
+	else
+		restore; cleanup
+		die "新しい gluetun の遮断ルール・ルーティングを取得できませんでした (書き換えはやめました)"
+	fi
+fi
+
+echo >&2
+printf 'update-pins: 上の差分を確かめました。compose.yaml を新しい固定値で書き換えますか? [y/N] ' >&2
+IFS= read -r ans </dev/tty || ans=""
+case "$ans" in
+	y | Y | yes) ;;
+	*) restore; cleanup; info "書き換えませんでした"; exit 0 ;;
+esac
+if [ -n "$fw_changed" ]; then
+	printf 'update-pins: 遮断ルールの差分を1行ずつ確かめ、通信を広げるものが無いと判断しましたか? 期待値を新しい値に置き換えるなら yes と入力してください (それ以外は compose.yaml も元に戻します): ' >&2
+	IFS= read -r ans </dev/tty || ans=""
+	if [ "$ans" != "yes" ]; then
+		restore; cleanup; info "書き換えませんでした"; exit 0
+	fi
+	cp "$WORKDIR/fw" "$ROOT/templates/firewall-expected.txt" || { restore; cleanup; die "期待値を書き換えられません"; }
+	info "templates/firewall-expected.txt を新しい値に置き換えました"
+fi
+trap - INT TERM HUP
+cleanup
+info "compose.yaml を書き換えました:"
+git -C "$ROOT" --no-pager diff --stat -- compose.yaml templates/firewall-expected.txt >&2 2>/dev/null
+
+echo >&2
+info "次にすること:"
+n=0
+step() { n=$((n + 1)); info "  $n. $*"; }
+step "テスト: $ROOT/tests/firewall-test.sh と $ROOT/tests/ssh-test.sh"
+[ -n "$changed_ub" ] && step "vpnsh build (新しいベースイメージで work を作り直す)"
+[ -n "$changed_gl" ] && step "vpnsh up --recreate (新しい gluetun に作り直す。キーチェーンの確認が出ます)"
+step "問題がなければ compose.yaml$([ -n "$fw_changed" ] && echo ' と templates/firewall-expected.txt') をコミットする。やめるなら git -C $ROOT checkout -- compose.yaml templates/firewall-expected.txt"

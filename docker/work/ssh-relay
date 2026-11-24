@@ -1,0 +1,129 @@
+#!/usr/bin/perl
+# VPNShell: SSH エージェント中継のコンテナ側 (docker exec -i で Mac 側から起動される)
+#
+# コンテナ内の ssh が使う Unix ソケット (/tmp/vpnsh-agent/agent.sock) で待ち受け、
+# 受け付けた接続ごとに番号を付けて、標準入出力の1本のストリームに多重化して Mac 側へ流す。
+# Mac 側は接続ごとに専用 ssh-agent へ新しく接続する (1対1。ssh-agent は接続ごとに接続先の
+# 情報 (session-bind) を記録するので、使い回すと接続先に縛った鍵が使えなくなるため)。
+# 通してよい要求の種類は Mac 側の中継が絞る (鍵の追加・削除・ロックなどは通さない)。
+#
+# 枠の形式: 種類(1バイト: O=開く / D=データ / C=閉じる) + 番号(4バイト) + 長さ(4バイト) + データ
+# 承認の判断はしない (Mac 側の ssh-agent と確認ダイアログが行う)。枠の長さと同時接続数には上限を設ける。
+#
+# 標準入力が閉じたら (Mac 側の vpnsh が終わったら)、PID 1 に SIGHUP を送ってシェルごと終了する。
+# 抽象名前空間のソケットや localhost の TCP は使わない (同じネットワーク名前空間の他のシェルから届くため)。
+use strict;
+use warnings;
+no warnings 'uninitialized';
+use IO::Socket::UNIX;
+use IO::Select;
+use Socket qw(SOCK_STREAM);
+use Errno qw(EAGAIN EWOULDBLOCK EINTR);
+use POSIX ();
+
+my $DIR = "/tmp/vpnsh-agent";
+my $PATH = "$DIR/agent.sock";
+my $MAX = 262144;          # ssh-agent のメッセージの上限 (256KiB) に合わせる
+my $MAX_CONN = 32;         # 1シェルあたりの同時接続数の上限 (エージェントのファイル記述子を使い切らせない)
+my $WRITE_TIMEOUT = 10;    # 書き込めない状態がこの秒数続いたら、その接続 (または中継) を終える
+
+# 同じユーザーの別のプロセスから、このプロセスのメモリや入出力 (/proc/<pid>/mem・fd) を覗かれないようにする
+# (PR_SET_DUMPABLE = 0。prctl のシステムコール番号は aarch64 で 167、x86_64 で 157)
+{
+	my $m = (POSIX::uname())[4];
+	my $nr = $m eq 'aarch64' ? 167 : $m eq 'x86_64' ? 157 : undef;
+	syscall($nr, 4, 0, 0, 0, 0) if defined $nr;
+}
+
+umask 077;
+mkdir $DIR, 0700 unless -d $DIR;
+chmod 0700, $DIR;
+unlink $PATH;
+my $srv = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $PATH, Listen => 16)
+	or exit 1;
+binmode STDIN;
+binmode STDOUT;
+
+my $sel = IO::Select->new($srv, \*STDIN);
+my (%conn, %id_of);
+my $next = 1;
+my $inbuf = '';
+
+# write_all <ハンドル> <データ>  書き込めない状態が続いたら 0 を返す
+sub write_all {
+	my ($fh, $buf) = @_;
+	my $ws = IO::Select->new($fh);
+	while (length $buf) {
+		return 0 unless $ws->can_write($WRITE_TIMEOUT);
+		my $n = syswrite($fh, $buf);
+		if (!defined $n) { next if $! == EINTR || $! == EAGAIN || $! == EWOULDBLOCK; return 0; }
+		substr($buf, 0, $n, '');
+	}
+	return 1;
+}
+sub send_frame {
+	my ($t, $id, $d) = @_;
+	$d = '' unless defined $d;
+	write_all(\*STDOUT, pack('a1NN', $t, $id, length $d) . $d) or lifeline();
+}
+sub close_conn {
+	my ($id, $notify) = @_;
+	my $c = delete $conn{$id} or return;
+	delete $id_of{fileno $c} if defined fileno $c;
+	$sel->remove($c);
+	close $c;
+	send_frame('C', $id) if $notify;
+}
+sub lifeline {
+	unlink $PATH;
+	kill 'HUP', 1;
+	exit 0;
+}
+$SIG{PIPE} = 'IGNORE';
+$SIG{TERM} = \&lifeline;
+
+while (1) {
+	for my $fh ($sel->can_read) {
+		next unless defined fileno $fh;
+		if ($fh == $srv) {
+			my $c = $srv->accept or next;
+			if (keys(%conn) >= $MAX_CONN) { close $c; next; }
+			$c->blocking(0);
+			my $id = $next++;
+			$conn{$id} = $c;
+			$id_of{fileno $c} = $id;
+			$sel->add($c);
+			send_frame('O', $id);
+		}
+		elsif ($fh == \*STDIN) {
+			my $n = sysread(STDIN, my $b, 65536);
+			lifeline() unless $n;
+			$inbuf .= $b;
+			while (length($inbuf) >= 9) {
+				my ($t, $id, $len) = unpack('a1NN', $inbuf);
+				lifeline() if $len > $MAX;
+				last if length($inbuf) < 9 + $len;
+				my $d = substr($inbuf, 9, $len);
+				substr($inbuf, 0, 9 + $len, '');
+				if ($t eq 'D') {
+					my $c = $conn{$id} or next;
+					write_all($c, $d) or close_conn($id, 1);
+				}
+				elsif ($t eq 'C') {
+					close_conn($id, 0);
+				}
+				else {
+					lifeline();
+				}
+			}
+		}
+		else {
+			my $id = $id_of{fileno $fh};
+			next unless defined $id;
+			my $n = sysread($fh, my $b, 65536);
+			if (!defined $n) { next if $! == EAGAIN || $! == EWOULDBLOCK || $! == EINTR; close_conn($id, 1); }
+			elsif ($n == 0) { close_conn($id, 1); }
+			else { send_frame('D', $id, $b); }
+		}
+	}
+}
