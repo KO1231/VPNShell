@@ -68,6 +68,9 @@ jobs:
       - name: Mount safety tests
         run: /bin/bash tests/mount-test.sh
 
+      - name: SSH tests
+        run: /bin/bash tests/ssh-test.sh
+
   image:
     runs-on: ubuntu-latest
     timeout-minutes: 30
