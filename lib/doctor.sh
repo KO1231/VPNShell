@@ -1,14 +1,6 @@
 # shellcheck shell=bash
 # shellcheck disable=SC2088  # 表示用に "~/..." の文字列をそのまま使う
 # shellcheck disable=SC2153  # SSH_AGENT_DIR などは lib/ssh.sh で定義している
-# vpnsh doctor: 設定や状態を一括で点検する
-#
-# - 通信はしない (Docker への問い合わせだけ)。vpnsh の確認ダイアログも出さない (キーチェーンは項目の権限を読むだけで、
-#   秘密の値は読まない。ロックされていても解除のダイアログを出さない dump-keychain を使う。show-keychain-info は
-#   ロック中に解除のダイアログを出すので使わない)
-# - ~/.ssh/config に Match exec があるときは、ssh -G (コマンドが実行される) を呼ばない
-# - 直すことはしない。何をすればよいかを表示する (キーチェーンの確認結果の控えだけ state/ に書く)
-# - bin/vpnsh の関数 (work_list、work_build_hash、host_checks など) を使う
 
 DR_NG=0
 DR_WARN=0
@@ -97,8 +89,7 @@ dr_config() {
 	return 0
 }
 
-# dr_kc_acl <キーチェーン>  vpnsh の項目の「取り出し (decrypt)」の権限を出す
-#   "applications (0):" = 確認なしで取り出せるアプリは無い / その後の "app: <パス>" = 確認なしで取り出せるアプリ
+# dr_kc_acl <キーチェーン>  vpnsh の項目を確認なしで取り出せるアプリの一覧を出す
 dr_kc_acl() {
 	"$VPNSH_SECURITY" dump-keychain -a ${1:+"$1"} 2>/dev/null | awk -v s="$VPNSH_KC_SERVICE" -v a="$VPNSH_KC_ACCOUNT" '
 		/^keychain: / { svc = ""; acct = ""; dec = 0; inapps = 0; next }
@@ -119,11 +110,9 @@ dr_keychain() {
 		dr_ng "キーチェーンに WireGuard の秘密鍵がありません"; dr_hint "vpnsh setup --import <NordVPN の .conf>"
 	else
 		dr_ok "キーチェーンに WireGuard の秘密鍵がある"
-		# 取り出し (decrypt) を確認なしで許されたアプリが無いこと (「常に許可」を押すと /usr/bin/security が載る)。
-		# 項目の属性と権限を読むだけで、秘密の値は読まない (確認ダイアログは出ない)
+		# 取り出しを確認なしで許されたアプリが無いこと (権限を読むだけで、秘密の値は読まない)
 		kc="$("$VPNSH_SECURITY" default-keychain 2>/dev/null | sed 's/^[[:space:]]*"//; s/"[[:space:]]*$//')"
-		# キーチェーンのファイルが前回の確認から変わっていなければ、前回の結果 (問題なし) を使う
-		# (「常に許可」を押すとキーチェーンに書き込みが起きるので、変わっていれば必ず確かめ直す)
+		# キーチェーンのファイルが前回の確認から変わっていなければ、前回の結果を使う
 		local stamp="" cache="$VPNSH_STATE_DIR/doctor-keychain"
 		[ -f "$kc" ] && stamp="$kc $(stat -f '%i %z %m' "$kc" 2>/dev/null)"
 		if [ -n "$stamp" ] && [ "$(cat "$cache" 2>/dev/null)" = "$stamp" ]; then
@@ -156,7 +145,6 @@ dr_keychain() {
 		esac
 	fi
 	# ダウンロードした .conf (秘密鍵が平文) が残っていないか
-	# (macOS が、ターミナルにフォルダへのアクセスの許可を求めることがある。読めなかったフォルダは [--] で示す)
 	local unread="" checked=""
 	files=""
 	for f in "$HOME/Downloads" "$HOME/Desktop" "$HOME/Documents" "$HOME/.Trash"; do

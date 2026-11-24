@@ -11,6 +11,9 @@ $ vpnsh
 203.0.113.10
 ```
 
+<img width="2400" height="1240" alt="architecture" src="https://github.com/user-attachments/assets/62e91f60-f39d-4680-ad1e-b16b20ecf889" />
+
+
 ## Features
 
 - **Fail-closed design** — the firewall rules, routing, DNS, IPv6 and the integrity of gluetun are verified on every start, and the public IP is checked against your Dedicated IP using multiple check services run by different operators

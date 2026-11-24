@@ -1,15 +1,4 @@
 #!/bin/bash
-# VPNShell: work コンテナ内の追加の診断 (起動前チェックに通ったあとで、entrypoint.sh から呼ばれる)
-#
-#   diag.sh full   漏れの実地検査 (VPN を通らない経路で外に出られないことを、実際に送って確かめる)
-#   diag.sh mtu    MTU の診断 (分割禁止の ping で、トンネルを通る最大の大きさを調べる)
-#
-# 入力 (環境変数):
-#   EXPECTED_PUBLIC_IP   専用IP
-#   VPNSH_LAN_ADDRS      Mac 側の LAN のアドレス (Mac 自身・ルーター。空白区切り。届かないことを確かめる)
-#   VPNSH_EP_IP / VPNSH_EP_PORT  VPN の接続先 (WireGuard 以外では届かないことを確かめる)
-# 結果は stderr に [OK] / [NG] / [--] (確かめられなかった) で出す。NG が1つでもあれば 1、なければ 0 で終わる
-# ([--] は失敗としない。最後のまとめで件数を出す)
 set -u
 
 FAILED=0
@@ -18,9 +7,7 @@ ng() { FAILED=1; printf 'vpnsh: \033[31m[NG]\033[0m %s\n' "$*" >&2; }
 na() { printf 'vpnsh: [--] %s\n' "$*" >&2; }
 is_ipv4() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
 
-# tcp_try <eth0|-> <IP> <ポート>  TCP 接続を試みる (eth0: eth0 を直接指定して、トンネルを通さずに / -: 普通の経路で)
-#   0 = つながった / 4 = 拒否された (RST が返った = 相手に届いている) / 1 = 遮断された・届かない / 2,3 = ソケットを作れない
-#   遮断ルールの DROP に当たった接続は、時間切れ (2秒) まで待つ。検査は並列に走らせて全体の時間を抑える
+# tcp_try <eth0|-> <IP> <ポート>  TCP 接続を試みる (0=つながった / 4=拒否 (届いた) / 1=遮断・届かない / 2,3=ソケットを作れない)
 tcp_try() {
 	perl -MSocket -MIO::Select -MErrno=EINPROGRESS,ECONNREFUSED -e '
 		my ($dev, $ip, $port) = @ARGV;
@@ -39,9 +26,7 @@ tcp_try() {
 		exit 1;
 	' "$1" "$2" "$3"
 }
-# reached <eth0|-> <IP>  よく使うポート (22, 80, 443) と ping を同時に試す
-#   0 = どれかが届いた (届いた方法を出す) / 1 = どれも届かない / 2 = どれも試せなかった (ソケットを作れないなど)
-#   eth0 を指定したときは、ping も eth0 を指定して送る (普通の経路の ping はトンネルに入るので、Mac の LAN の検査にならない)
+# reached <eth0|-> <IP>  ポート 22・80・443 と ping を同時に試す (0=どれかが届いた / 1=どれも届かない / 2=試せなかった)
 reached() {
 	local dev="$1" ip="$2" d p hit="" tried=""
 	d="$(mktemp -d /tmp/vpnsh-reach.XXXXXX)"
@@ -73,9 +58,7 @@ reached() {
 	[ -n "$tried" ] && return 1
 	return 2
 }
-# dns_eth0 <IP>  eth0 を直接指定して DNS の問い合わせを送る
-#   0 = 応答があった (外に出られる) / 5 = 送信が遮断ルールで止められた (EPERM。遮断を確認できた) /
-#   1 = 送れたが応答がない (遮断を確認できない) / 2,3 = ソケットを作れない
+# dns_eth0 <IP>  eth0 を直接指定して DNS を問い合わせる (0=応答あり / 5=遮断された / 1=応答なし / 2,3=ソケットを作れない)
 dns_eth0() {
 	perl -MSocket -MIO::Select -MErrno=EPERM -e '
 		my ($ip) = @ARGV;
@@ -162,8 +145,7 @@ chk_gateway() {
 		ok "eth0 のゲートウェイ ($gw) には届かない"
 	fi
 }
-# Mac のアドレス (Mac 自身・ルーター・OrbStack のブリッジなど) に、eth0 から (トンネルを通さずに) 届かないこと。
-# すべて同時に試し、問題が無ければ1行にまとめて出す
+# Mac のアドレス (Mac 自身・ルーターなど) に、eth0 から届かないこと
 chk_lan() {
 	local d addr i=0 rc r list="" bad=0 untested=""
 	d="$(mktemp -d /tmp/vpnsh-lan.XXXXXX)"

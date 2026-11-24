@@ -1,15 +1,6 @@
 #!/bin/bash
 # shellcheck disable=SC2015  # ok / ng は常に 0 を返すので A && B || C で問題ない
 # shellcheck disable=SC2016  # コンテナの中で展開させる文字列なので、わざと単一引用符にしている
-# work イメージの固さのテスト。gluetun も VPN も使わない (ネットワークなしで動かす)。CI (GitHub Actions) でも実行する。
-#
-#   - setuid / setgid とファイル capability が無い
-#   - 書き込めるのはホームと /tmp・/var/tmp だけ (root でも /tmp・/var/tmp だけ)
-#   - ptrace が禁止されている (templates/seccomp-work.json)
-#   - ~/.local/bin が PATH の最後にある
-#   - イメージの中のスクリプトが構文として正しく、必要なツールがそろっている
-#
-# 使い方: tests/image-test.sh   (先に vpnsh build などで vpnshell-work:local を作っておく。docker は今の context を使う)
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"

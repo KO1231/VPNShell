@@ -1,12 +1,4 @@
 #!/bin/bash
-# VPNShell: 固定しているイメージ (gluetun、ubuntu) の新しい版を確かめ、承認したら compose.yaml を書き換える
-#
-#   scripts/update-pins           確かめて、新しい版があれば書き換えるか聞く
-#   scripts/update-pins --check   確かめるだけ (新しい版があれば終了コード 1)
-#
-# 調べる先: GitHub の gluetun のリリース (最新の安定版のタグ)、Docker Hub (マルチアーキテクチャのインデックスのダイジェスト)。
-# gluetun を更新したときは、新しい版の遮断ルール・ルーティングと期待値 (templates/firewall-expected.txt) の差分を出す。
-# 期待値は自動では書き換えない (差分の1行ずつを人が確かめ、通信を広げるもの (ACCEPT の追加、DROP の削除、ルーティングの追加) でないことを確認する)
 # shellcheck disable=SC2015  # A && B || die の die は終了するので、if-then-else と同じに動く
 set -u
 umask 077
@@ -37,8 +29,7 @@ index_digest() {
 	'
 }
 
-# gluetun の GitHub のリポジトリ。2026-11 に qdm12/gluetun から移動した (利用者が正当と確認。README に
-# qdm12 と Docker Hub の qmcgaw/gluetun が書かれていることも確認)。ここからさらに移動していれば警告する
+# gluetun の GitHub のリポジトリ (ここから移動していれば警告する)
 GL_REPO="passteque/gluetun"
 gh_api() { curl -fsSL --max-time 15 -H 'Accept: application/vnd.github+json' "https://api.github.com/$1"; }
 info "gluetun の最新の安定版を GitHub で確認しています"
@@ -91,9 +82,7 @@ fi
 # 表示する差分は制御文字を見える形にする (細工したイメージがエスケープシーケンスで行を隠せないように)
 show() { perl -pe 's/([\x00-\x08\x0b-\x1f\x7f])/"^" . chr(ord($1) ^ 64)/ge; s/^/    /' >&2; }
 
-# 判断の材料 (差分) を先に見せてから、書き換えるかを聞く。
-# 遮断ルールを取得するには compose.yaml を新しい値にしておく必要があるので、元のファイルを控えてから仮に書き換え、
-# 「やめる」なら元に戻す
+# 差分を先に見せてから書き換えるかを聞く (compose.yaml は控えてから仮に書き換え、やめるなら戻す)
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/vpnsh-pins.XXXXXX")"
 cp -p "$COMPOSE" "$WORKDIR/compose.yaml.orig" || die "compose.yaml を控えられません"
 restore() {

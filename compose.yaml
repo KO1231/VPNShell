@@ -1,8 +1,4 @@
-# VPNShell
-#
-# docker compose を直接実行しないでください。必ず bin/vpnsh 経由で操作します。
-# (vpnsh は COMPOSE_* / DOCKER_* 環境変数を消し、プロジェクト名・ファイル・context を固定し、
-#  secret をキーチェーンから取り出し、遮断ルールを生成してから compose を呼びます)
+# docker compose を直接実行せず、必ず bin/vpnsh 経由で操作する
 
 name: vpnshell
 
@@ -13,16 +9,13 @@ services:
     container_name: ${VPNSH_GLUETUN_NAME:-vpnshell-gluetun}
     cap_add:
       - NET_ADMIN
-    # Docker 組み込み DNS の上流を明示する。こうすると転送がコンテナ側の名前空間から行われ、
-    # 遮断ルールで止まる (未指定だとホスト側から Mac の DNS へ素の IP で転送される)
+    # Docker 組み込み DNS の上流を明示し、転送をコンテナ側の名前空間から行わせる (遮断ルールで止まる)
     dns:
       - 1.1.1.1
     sysctls:
       net.ipv6.conf.all.disable_ipv6: "1"
       net.ipv6.conf.default.disable_ipv6: "1"
-      # 権限の無いプロセスは 1024 未満のポートで待ち受けられないようにする (名前空間ごとの値なので work にも効く)。
-      # 全シェルが同じネットワーク名前空間にいるため、これが無いと、あるシェルが 127.0.0.1:53 を先に取って
-      # 他のシェルの名前解決を乗っ取れる (gluetun の DNS が止まっている間など)
+      # 権限の無いプロセスに 1024 未満のポートで待ち受けさせない (別のシェルによる 127.0.0.1:53 の乗っ取りを防ぐ)
       net.ipv4.ip_unprivileged_port_start: "1024"
     environment:
       VPN_SERVICE_PROVIDER: custom
@@ -45,8 +38,7 @@ services:
       - source: http_control_server_auth_default_role
         mode: 0400
     volumes:
-      # 遮断ルール (vpnsh が templates/post-rules.txt.tmpl から生成する)。
-      # 元ファイルが無いときに Docker が空のディレクトリを作らないよう create_host_path: false
+      # 遮断ルール (vpnsh が生成する)。元ファイルが無いときに空のディレクトリを作らせない
       - type: bind
         source: ${VPNSH_STATE_DIR:-./state}/post-rules.txt
         target: /iptables/post-rules.txt
@@ -81,17 +73,14 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-      # Docker の既定の seccomp から ptrace / process_vm_readv / process_vm_writev を外したもの。
-      # 同じシェルの中の別のプロセスが、対話 bash や SSH の中継を覗き見・操作できないようにする
-      # (元: github.com/moby/profiles seccomp/default.json @ 9ee3204f0d0c、sha256 3320527d…)
+      # Docker の既定の seccomp (moby/profiles @ 9ee3204f0d0c) から ptrace / process_vm_readv / process_vm_writev を外したもの
       - seccomp=./templates/seccomp-work.json
     init: true
     stop_signal: SIGHUP
     # 暴走 (fork bomb やメモリの使い切り) で OrbStack の VM 全体が不安定にならないように
     pids_limit: 1024
     mem_limit: 4g
-    # ルートのファイルシステムは読み取り専用 (root になられても、プログラムや vpnsh のスクリプトを
-    # すり替えられないように)。書き込めるのは /tmp・/var/tmp (tmpfs) とホーム (使い捨てボリューム) だけ
+    # ルートは読み取り専用。書き込めるのは /tmp・/var/tmp (tmpfs) とホーム (使い捨てボリューム) だけ
     read_only: true
     tmpfs:
       - /tmp:rw,nosuid,nodev,exec,size=1g
@@ -102,8 +91,7 @@ services:
       # ホームはコンテナごとの使い捨てボリューム (ディスク上なのでメモリを圧迫しない。--rm で消える)
       - type: volume
         target: /home/vpnsh
-      # DNS は gluetun 内蔵 (127.0.0.1) だけを使う。network_mode: service:gluetun のコンテナは
-      # gluetun の dns: 設定 (1.1.1.1) を引き継ぐため、上書きして固定する
+      # DNS は gluetun 内蔵 (127.0.0.1) だけを使う (gluetun の dns: を引き継がないよう上書きする)
       - type: bind
         source: ./templates/work-resolv.conf
         target: /etc/resolv.conf

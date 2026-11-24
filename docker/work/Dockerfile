@@ -1,5 +1,4 @@
 # syntax=docker/dockerfile:1
-# VPNShell の作業用コンテナ (使い捨て)
 # ベースイメージは compose.yaml の BASE_IMAGE (ubuntu:24.04 をインデックスのダイジェストで固定) で渡す
 
 ARG BASE_IMAGE=ubuntu:24.04
@@ -17,11 +16,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # パッケージ一覧 (packages.local.txt は個人用・任意。無くてもよい)
 COPY packages.txt packages.local.tx[t] /tmp/vpnsh-packages/
 
-# パッケージの更新とインストール、そして固くする処理を1つの RUN で行う (層を増やさないため)
-#   - apt-get upgrade: ベースイメージの時点より新しいセキュリティ修正を入れる (glibc など)
-#   - setuid / setgid を外す (no-new-privileges で既に無効だが、root を狙う足場を減らす)
-#   - ファイル capability を外す (ping の cap_net_raw は no-new-privileges の下では起動自体を拒否させる。
-#     外すと権限なしの ICMP ソケット (ping_group_range) で動く)
+# パッケージの更新・インストールと、setuid / setgid・ファイル capability の除去を1つの RUN で行う
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     set -eux; \
@@ -36,8 +31,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     test -z "$(find / -xdev -perm /6000 -type f)"; \
     test -z "$(getcap -r / 2>/dev/null)"
 
-# 一般ユーザー (UID/GID は Mac に合わせる。GID 20 は Ubuntu では dialout だが、そのまま主グループに使う)
-# sudo は入れない
+# 一般ユーザー (UID/GID は Mac に合わせる。sudo は入れない)
 RUN set -eux; \
     if id ubuntu >/dev/null 2>&1; then userdel -r ubuntu; fi; \
     if ! getent group "${USER_GID}" >/dev/null; then groupadd -g "${USER_GID}" vpnsh; fi; \
@@ -50,8 +44,7 @@ RUN set -eux; \
 
 # VPNShell のスクリプト (root 所有。コンテナ内のユーザーからは書き換えられない)
 COPY --chmod=0755 entrypoint.sh preflight.sh diag.sh ssh-relay /usr/local/lib/vpnsh/
-# bash の設定は全員共通の /etc/bash.bashrc に置く (Ubuntu の bash は対話シェルのたびにまず読む。
-# 入れ子の bash でも同じプロンプトになる。root 所有で、読み取り専用のファイルシステムの上にある)
+# bash の設定は root 所有の /etc/bash.bashrc に置く (入れ子の bash でも同じ設定になる)
 COPY --chmod=0644 bashrc /etc/bash.bashrc
 
 LABEL org.opencontainers.image.title="vpnshell-work" \

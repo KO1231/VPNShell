@@ -1,33 +1,5 @@
 #!/bin/bash
 # shellcheck disable=SC2015  # ok / ng は常に 0 を返すので A && B || C で問題ない
-# gluetun のファイアウォール (遮断ルール) と vpnsh の検査の回帰テスト
-#
-# 実在しない接続先 (TEST-NET-1 の 192.0.2.10) と乱数の鍵で gluetun を作成し、次を確認する。
-# VPN にはつながらない (つながる必要もない)。本物の鍵・キーチェーン・.env には一切触れない
-# (キーチェーンからの取り出し kc_get は、乱数の鍵を返す関数に差し替える)。
-#
-#   0. post-rules の元ファイルが無いと、gluetun の作成が失敗する
-#   1. vpnsh と同じ手順 (作成 → 検査 → 起動) で作成でき、ファイアウォールとルーティングが期待値と一致する
-#   1b. 別の vpnsh が作ったばかりの gluetun を、作成の重なりで壊さない
-#   2. 遮断ルール・ルーティングの改ざん (余分な ACCEPT、先頭への挿入、既定の方針、ルールの削除、nat・mangle・
-#      ip6tables・legacy への追加、ルーティングの追加) を検出する
-#   3. work 相当のコンテナ (cap_drop ALL) から:
-#      - Docker 組み込み DNS (127.0.0.11) が即座に拒否される
-#      - 制御用サーバー (:8000) が API キーなしで 401
-#      - eth0 のゲートウェイ (OrbStack / Mac 側) に届かない
-#      - eth0 を直接指定した (SO_BINDTODEVICE) 目印なしの UDP はエンドポイント宛てでも遮断される
-#      - IPv6 が無効、gluetun の /run/secrets が見えない、ネットワーク名前空間が gluetun と同じ
-#   4. 起動前チェック (compose の work 設定のまま) が、不健全な VPN で 125 で失敗し、各項目を確認している
-#   4a. 外部IP の照合 (全件一致、1件だけ違う、応答が1件だけ、IP を読めない、observe で IP が分かれる)
-#   4b. work イメージと実行時の固さ (setuid、書き込める場所、ptrace、PATH、1024 未満のポート)
-#   4c. 漏れの実地検査 (vpnsh check --full の検査) と、わざと開けた穴の検出
-#   4d. VPN の通信の監視 (Mac 側)
-#   5. gluetun の整合性検査が、作成時の記録との違い (環境変数・ID) を検出する
-#   6. シェルの持ち主の判定が、ロケールやタイムゾーンに左右されない
-#
-# 使い方:
-#   tests/firewall-test.sh          テストを実行する (OrbStack が動いていること)
-#   tests/firewall-test.sh --dump   期待値ファイルを更新するために、正規化した実際の値を出力する
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
@@ -223,8 +195,7 @@ else
 	ngline "応答した確認サービスが 0 件" && ok "外部IP を確認できないことを検出する" || ng "外部IP の失敗を検出しない"
 
 	echo "== 4a. 外部IP の照合"
-	# gluetun の名前空間の 127.0.0.1 に、確認サービスの代わりの小さな HTTP サーバーを3つ立てる (ポート 18081〜18083)。
-	# 返す本文は、サーバーのコンテナの /tmp/ip.<ポート> の中身 (ファイルが無ければ応答せずに閉じる)
+	# gluetun の名前空間に、確認サービスの代わりの HTTP サーバーを3つ立てる (本文は /tmp/ip.<ポート>)
 	vpnsh_docker run -d --name "$VPNSH_PROJECT-ipsrv" --network "container:$NAME" --entrypoint perl vpnshell-work:local -e '
 		use IO::Socket::INET;
 		for my $p (18081, 18082, 18083) {

@@ -1,20 +1,15 @@
 #!/bin/bash
 # shellcheck disable=SC2088  # 表示用に "~/..." の文字列をそのまま扱う箇所がある
-# vpnsh: 特定のシェルの通信だけを NordVPN 専用IP 経由にする (OrbStack + gluetun)
-#
-# macOS の /bin/bash 3.2 で動くように書く。使い方は `vpnsh help`。
 set -u
 umask 077
 
-# 利用者の PATH には、コンテナから書き換えられる場所 (mount-root の配下。direnv の PATH_add、node_modules/.bin など)
-# が入り得る。安全にする (vpnsh_safe_path) までは使わず、決まった場所のコマンドだけを使う。
-# 元の PATH は、vpnsh_safe_path に渡すときと、doctor が「vpnsh が PATH から使えるか」を調べるときだけ使う
+# 安全にする (vpnsh_safe_path) までは、元の PATH を使わず決まった場所のコマンドだけを使う
 VPNSH_ORIG_PATH="$PATH"
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 # CDPATH があると、相対パスの cd が別のディレクトリに移り (移った先も表示する)、リポジトリの場所を取り違えるため
 unset CDPATH
 
-VPNSH_VERSION="1.0.1"
+VPNSH_VERSION="1.0.2"
 
 # 対象のプロジェクトやコンテナ名を環境変数で上書きさせない (テストは lib を直接使う)
 unset VPNSH_PROJECT VPNSH_CONTEXT VPNSH_GLUETUN_NAME VPNSH_STATE_DIR VPNSH_ENV_FILE VPNSH_TEST_SSH_CONFIG
@@ -54,7 +49,7 @@ vpnsh_clean_env
 # マウントを許可するディレクトリ (vpnsh config set mount-root で変えられる。既定 ~/Projects)
 VPNSH_MOUNT_ROOT="$(vpnsh_env_get VPNSH_MOUNT_ROOT)"
 [ -n "$VPNSH_MOUNT_ROOT" ] || VPNSH_MOUNT_ROOT="$HOME/Projects"
-# 元の PATH からマウントできる場所 (mount-root の配下) などを除く (lib/common.sh の vpnsh_safe_path)
+# 元の PATH からマウントできる場所 (mount-root の配下) などを除く
 PATH="$(PATH="$VPNSH_ORIG_PATH" vpnsh_safe_path "$VPNSH_MOUNT_ROOT")"
 export PATH
 
@@ -127,8 +122,7 @@ EOF
 }
 
 # ---- 小物 ----
-# no_args <コマンド> [引数...]  引数を取らないコマンドに引数があれば、使い方の誤り (終了コード 2) で止める
-# (打ち間違いや、コマンドの後ろに書いたオプションを黙って無視しないように)
+# no_args <コマンド> [引数...]  引数を取らないコマンドに引数があれば、終了コード 2 で止める
 no_args() {
 	local c="$1"; shift
 	[ "$#" -eq 0 ] && return 0
@@ -191,9 +185,8 @@ docker_unreachable() {
 	vpnsh_die "OrbStack が起動しているか確認してください (\`orb start\`)" "$VPNSH_EXIT_PREFLIGHT"
 }
 
-# ---- ロック (gluetun の作成・作り直しなど、変更操作だけにかける) ----
-# ロックのディレクトリに「PID 開始時刻」を書く。持ち主のプロセスがもう無ければ奪う。
-# 奪うときは mv で別名にしてから消す (同時に奪おうとしたもう一方が、取り直したロックを消さないように)
+# ---- ロック (変更操作だけにかける) ----
+# ロックのディレクトリに「PID 開始時刻」を書き、持ち主がもう無ければ mv で別名にしてから消して奪う
 LOCK_DIR=""
 LOCK_HELD=""
 lock_acquire() {
@@ -204,8 +197,7 @@ lock_acquire() {
 	while ! mkdir "$LOCK_DIR" 2>/dev/null; do
 		owner="$(cat "$LOCK_DIR/owner" 2>/dev/null)"
 		pid="${owner%% *}"; start="${owner#* }"
-		# 持ち主が書かれていない (mkdir と書き込みの間で強制終了された・ディスクが一杯だった) ロックは、
-		# 作られてから 10 秒たっていれば残骸とみなす
+		# 持ち主が書かれていないロックは、作られてから 10 秒たっていれば残骸とみなす
 		local empty_stale=""
 		if [ -z "$owner" ] && [ -d "$LOCK_DIR" ] && [ $(($(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || date +%s))) -ge 10 ]; then
 			empty_stale=1
@@ -244,9 +236,7 @@ lock_release() {
 trap 'lock_release; [ -n "${SESSION_SSH_DIR:-}" ] && ssh_session_remove "$SESSION_SSH_DIR"' EXIT
 
 # ---- work コンテナ (シェル) の管理 ----
-# work_list  「ID PID 開始時刻 状態」を1行ずつ出す
-#   状態: alive (持ち主の vpnsh が動いている) / orphan (持ち主がいない) / unknown (ラベルが無く判定できない)
-#   開始時刻はロケールやタイムゾーンで表記が変わらないよう LC_ALL=C TZ=UTC で取る
+# work_list  「ID PID 開始時刻 状態 (alive / orphan / unknown)」を1行ずつ出す
 work_list() {
 	local id pid start
 	vpnsh_docker ps \
@@ -270,7 +260,7 @@ gc_orphans() {
 	local id pid start st n=0
 	while read -r id pid start st; do
 		[ "$st" = "orphan" ] || continue
-		vpnsh_docker kill -s HUP "$id" >/dev/null 2>&1 || vpnsh_docker rm -f "$id" >/dev/null 2>&1
+		vpnsh_docker kill -s HUP "$id" >/dev/null 2>&1 || vpnsh_docker rm -f -v "$id" >/dev/null 2>&1
 		n=$((n + 1))
 	done <<EOF
 $(work_list)
@@ -308,8 +298,7 @@ work_image_check() {
 	fi
 }
 
-# ---- gluetun を使える状態にして、ホスト側の検査をする ----
-# 成功すると SESSION_NETNS に gluetun のネットワーク名前空間が入る
+# ---- gluetun を使える状態にして、ホスト側の検査をする (成功すると SESSION_NETNS が入る) ----
 SESSION_NETNS=""
 prepare_gluetun() {
 	local r
@@ -396,14 +385,11 @@ EOF
 			--label "vpnsh.ssh=1")
 		ssh_relay_start
 	fi
-	# 対話シェルのときは、VPN の通信を Mac 側で監視する (lib/netmon.sh)
+	# 対話シェルのときは、VPN の通信を Mac 側で監視する
 	[ "$mode" = "shell" ] && netmon_start "$GL_ID"
 	trap 'kill_own_work; ssh_relay_stop; netmon_stop; ssh_session_remove "$SESSION_SSH_DIR"' HUP TERM INT
 	# shellcheck disable=SC2086
-	# --progress quiet: compose の「Container ... Creating / Created」の表示を出さない
-	# compose は裏で動かして wait で待つ (前面で動かすと、bash は compose が終わるまでシグナルの処理を後回しにするので、
-	# vpnsh の PID に TERM などを送っても、シェルを閉じるまで何も起きないため)。
-	# ジョブ制御の無い bash では裏のコマンドの標準入力が /dev/null になるので、端末やパイプを明示的に渡す
+	# compose は裏で動かして wait で待つ (前面だとシグナルの処理が compose の終了まで遅れるため)
 	exec 3<&0
 	vpnsh_compose --progress quiet run --rm --no-deps $tflag \
 		--label "vpnsh.pid=$$" --label "vpnsh.start=$start" \
@@ -532,8 +518,7 @@ EOF
 	return 0
 }
 
-# ssh_relay_start  コンテナが起動したら中継をつなぐ (バックグラウンド)
-# 探すのは「この vpnsh の PID と開始時刻」のラベルが付いた work だけ (PID が再利用されても古いシェルにつながない)
+# ssh_relay_start  この vpnsh の PID と開始時刻のラベルが付いた work が起動したら、中継をつなぐ
 SSH_RELAY_PID=""
 SESSION_START=""
 ssh_relay_start() {
@@ -920,8 +905,7 @@ EOF
 			rm -f "$SSH_KNOWN_HOSTS.old"
 		fi
 	fi
-	# 鍵がメモリにあれば外す (その鍵には取り除いた接続先への縛りが付いているため)。
-	# 同じ鍵を使う接続先が残っていれば、読み込み直すよう案内する
+	# 鍵がメモリにあれば外す (取り除いた接続先への縛りが付いているため)
 	fp="$(ssh_fp "$k")"
 	if [ -n "$fp" ] && ssh_agent_loaded | grep -qxF "$fp"; then
 		SSH_AUTH_SOCK="$SSH_AGENT_SOCK" vpnsh_timeout 3 /usr/bin/ssh-add -d "$k.pub" >/dev/null 2>&1
@@ -1129,7 +1113,6 @@ conf_get() {
 is_ipv4() { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
 
 # conf_sync_warning <ファイル>  .conf が同期・共有されやすい場所にあれば警告する
-# (秘密鍵は失効できず、漏れたときの回復は専用IPの変更 1 回だけなので)
 conf_sync_warning() {
 	local real home lower
 	real="$(perl -MCwd=abs_path -e 'print abs_path($ARGV[0]) // ""' "$1")"
@@ -1176,9 +1159,7 @@ cmd_setup() {
 	kc_valid_key "$pub" || vpnsh_die ".conf の [Peer] PublicKey が見つからないか、形式が正しくありません"
 	ip4addr="$(printf '%s' "$addr" | tr ',' '\n' | tr -d ' ' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?$' | head -n 1)"
 	[ -n "$ip4addr" ] || vpnsh_die ".conf の [Interface] Address に IPv4 アドレスがありません: $addr"
-	# アドレスは /32 にそろえる (NordVPN の .conf は /16 などのことがある)。
-	# /16 のままだと tun0 に 10.5.0.0/16 などの経路が増え、ルーティングの期待値と合わなくなる
-	# (どちらでも通信はすべてトンネルを通るので、/32 にしても動作は変わらない)
+	# アドレスは /32 にそろえる (/16 などのままだとルーティングの期待値と合わない)
 	if [ "${ip4addr#*/}" != "32" ]; then
 		vpnsh_info "Address $ip4addr を ${ip4addr%/*}/32 にそろえます"
 		ip4addr="${ip4addr%/*}/32"
@@ -1193,8 +1174,7 @@ cmd_setup() {
 		host="$resolved"
 	fi
 
-	# 書き換える前に、Docker (OrbStack) に届くことと、作り直しで切れるシェルがあるかを確かめる
-	# (キーチェーンや .env を書き換えてから「やめる」ことにならないように)
+	# 書き換える前に、Docker に届くことと、作り直しで切れるシェルがあるかを確かめる
 	local r0 n0 recreate_ok=""
 	gl_inspect; r0=$?
 	[ "$r0" -eq 2 ] && docker_unreachable
@@ -1228,8 +1208,7 @@ cmd_setup() {
 
 	cmd_build
 
-	# gluetun を作成 (既にあれば作り直す)。ロックを取ってから状態を調べ直す
-	# (待っている間に別の vpnsh が作っていれば、それを作り直す。作り直しの確認は最初に済ませている)
+	# ロックを取ってから状態を調べ直し、gluetun を作成する (既にあれば作り直す)
 	local r n
 	lock_acquire
 	gl_inspect; r=$?

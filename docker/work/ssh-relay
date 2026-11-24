@@ -1,17 +1,4 @@
 #!/usr/bin/perl
-# VPNShell: SSH エージェント中継のコンテナ側 (docker exec -i で Mac 側から起動される)
-#
-# コンテナ内の ssh が使う Unix ソケット (/tmp/vpnsh-agent/agent.sock) で待ち受け、
-# 受け付けた接続ごとに番号を付けて、標準入出力の1本のストリームに多重化して Mac 側へ流す。
-# Mac 側は接続ごとに専用 ssh-agent へ新しく接続する (1対1。ssh-agent は接続ごとに接続先の
-# 情報 (session-bind) を記録するので、使い回すと接続先に縛った鍵が使えなくなるため)。
-# 通してよい要求の種類は Mac 側の中継が絞る (鍵の追加・削除・ロックなどは通さない)。
-#
-# 枠の形式: 種類(1バイト: O=開く / D=データ / C=閉じる) + 番号(4バイト) + 長さ(4バイト) + データ
-# 承認の判断はしない (Mac 側の ssh-agent と確認ダイアログが行う)。枠の長さと同時接続数には上限を設ける。
-#
-# 標準入力が閉じたら (Mac 側の vpnsh が終わったら)、PID 1 に SIGHUP を送ってシェルごと終了する。
-# 抽象名前空間のソケットや localhost の TCP は使わない (同じネットワーク名前空間の他のシェルから届くため)。
 use strict;
 use warnings;
 no warnings 'uninitialized';
@@ -27,8 +14,7 @@ my $MAX = 262144;          # ssh-agent のメッセージの上限 (256KiB) に�
 my $MAX_CONN = 32;         # 1シェルあたりの同時接続数の上限 (エージェントのファイル記述子を使い切らせない)
 my $WRITE_TIMEOUT = 10;    # 書き込めない状態がこの秒数続いたら、その接続 (または中継) を終える
 
-# 同じユーザーの別のプロセスから、このプロセスのメモリや入出力 (/proc/<pid>/mem・fd) を覗かれないようにする
-# (PR_SET_DUMPABLE = 0。prctl のシステムコール番号は aarch64 で 167、x86_64 で 157)
+# 他のプロセスからメモリや入出力を覗かれないようにする (PR_SET_DUMPABLE = 0。prctl は aarch64 で 167、x86_64 で 157)
 {
 	my $m = (POSIX::uname())[4];
 	my $nr = $m eq 'aarch64' ? 167 : $m eq 'x86_64' ? 157 : undef;

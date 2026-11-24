@@ -1,18 +1,6 @@
 #!/bin/bash
 # shellcheck disable=SC2015  # ok / ng は常に 0 を返すので A && B || C で問題ない
 # shellcheck disable=SC2030,SC2031,SC2034  # サブシェルで変数を差し替えて試す。GL_* などは lib が参照する
-# Docker を使わない単体テスト。本物の gluetun・キーチェーン・~/.ssh・~/Library には触れない
-# (キーチェーンや docker を呼ぶ関数は、偽物の関数・スクリプトに差し替えて試す)。
-#
-#   1. PATH から、マウントできる場所・相対パスなどを除く (vpnsh_safe_path)
-#   2. 環境変数・.env・遮断ルールの値からの注入を防ぐ (vpnsh_clean_env、vpnsh_env_validate、fw_render、fw_normalize)
-#   3. gluetun の整合性の検査 (gl_env_policy、gl_verify_static、gl_pending_changes の sysctl)
-#   4. ホスト鍵の行の検査 (ssh_valid_keyscan_line)
-#   5. キーチェーンの権限の読み取り (dr_kc_acl。偽の security の出力で試す)
-#   6. 自動 down の判定 (idle_seconds、cmd_idle_check)
-#   7. 表示の安全 (vpnsh_visible) と、使い方の誤りの終了コード (bin/vpnsh)
-#
-# 使い方: tests/unit-test.sh
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
@@ -56,9 +44,7 @@ out="$(HOME="$T/home" PATH="$T/home/Projects/app/bin:./node_modules/.bin::$T/hom
 case ":$out:" in *"Projects"* | *":./"* | *"::"* | *"linked-bin"* | *nonexistent*) ng "残ってはいけないものが PATH に残った: $out" ;; *) ok "マウントできる場所の配下・相対パス・空・存在しない・シンボリックリンク経由のものを除く" ;; esac
 case ":$out:" in *":$T/home/bin:$T/other:"*) ok "それ以外は順序を保って残す" ;; *) ng "残すべきものが消えた: $out" ;; esac
 case ":$out:" in *":/usr/bin:/bin:/usr/sbin:/sbin:"*) ok "/usr/bin などを必ず含める" ;; *) ng "/usr/bin などが無い: $out" ;; esac
-# vpnsh は PATH を安全にするまで、元の PATH からコマンドを探さない
-# (mount-root の配下はコンテナから書き換えられるので、そこに置かれた偽の dirname などが Mac 側で動かないように)
-# 実際の .env (mount-root の設定など) に左右されないよう、bin と lib を .env の無い場所にコピーして起動する
+# vpnsh は PATH を安全にするまで、元の PATH からコマンドを探さない (.env の無い場所にコピーして試す)
 mkdir -p "$T/home4/Projects/app/bin" "$T/bin4" "$T/repo4"
 cp -R "$ROOT/bin" "$ROOT/lib" "$T/repo4/"
 for c in dirname readlink env sed cat tr grep awk perl; do
@@ -77,8 +63,7 @@ mkdir -p "$T/cdpath5/bin"
 out="$(cd "$T/repo4" && HOME="$T/home4" CDPATH="$T/cdpath5" bin/vpnsh --version 2>&1)"
 [ "$out" = "vpnsh $(sed -n 's/^VPNSH_VERSION="\(.*\)"$/\1/p' "$ROOT/bin/vpnsh")" ] &&
 	ok "CDPATH があっても、リポジトリの場所を取り違えない" || ng "CDPATH でリポジトリの場所を取り違えた: $out"
-# 大文字・小文字を区別しないファイルシステム (APFS の既定) では、綴りを変えてもマウントできる場所の配下を指せる。
-# 区別するファイルシステムでも判定を通すよう、小文字の綴りのディレクトリを実際に作って試す
+# 大文字・小文字を区別しない場合に備え、小文字の綴りのディレクトリを作って試す
 mkdir -p "$T/home2/projects/app/bin" "$T/home2/bin"
 out="$(HOME="$T/home2" PATH="$T/home2/projects/app/bin:$T/home2/bin" vpnsh_safe_path "$T/home2/projects")"
 out2="$(HOME="$T/home2" PATH="$T/home2/projects/app/bin:$T/home2/bin" vpnsh_safe_path "$T/HOME2/PROJECTS")"
@@ -100,8 +85,7 @@ for d in "$T/home" "$T/home/.ssh" "$T/home/.config/dev" "$T/home/Library/x" "$T/
 	HOME="$T/home" mnt_root_ok "$d" >/dev/null 2>&1 && { bad=$((bad + 1)); echo "    受け付けた: $d"; }
 done
 [ "$bad" -eq 0 ] && ok "ホームそのもの・. で始まるディレクトリの中・~/Library・空白を含むパス・ホームの外・相対パス・無いディレクトリは使えない" || ng "使えないはずの場所を $bad 個受け付けた"
-# 大文字・小文字を区別しないファイルシステム (APFS の既定) では、綴りを変えても ~/Library の中を指せる。
-# 区別するファイルシステムでも判定を通すよう、小文字の library を実際に作った別のホームでも試す
+# 大文字・小文字を区別しない場合に備え、小文字の library を作った別のホームでも試す
 mkdir -p "$T/home3/library/x"
 bad=0
 for d in "$T/home/library" "$T/home/library/x" "$T/home/LIBRARY/x" "$T/home/LiBrArY/x"; do
@@ -268,8 +252,7 @@ idle_case "持ち主のいないシェルだけなら破棄する" 10m "abc 123 
 idle_case "無効 (off) なら破棄しない" off "" 99999 99999 no
 
 echo "== 7. 表示の安全と使い方の誤り"
-# macOS の bash 3.2 は UTF-8 のとき、"$x、" の「、」の先頭のバイトを変数名の一部として読む (set -u で異常終了する)。
-# 変数の直後に日本語を書くときは ${x} にしなければならない
+# bash 3.2 では変数の直後の日本語が変数名の一部と読まれるので、${x} と書いていること
 out="$(perl -ne 'next if /^\s*#/; while (/(?<!\\)\$([A-Za-z_][A-Za-z0-9_]*)[\x80-\xff]/g) { print "$ARGV:$.: \$$1\n" } close ARGV if eof' \
 	"$ROOT"/bin/vpnsh "$ROOT"/lib/*.sh "$ROOT"/scripts/ssh-askpass "$ROOT"/scripts/update-pins "$ROOT"/tests/*.sh \
 	"$ROOT"/docker/work/*.sh "$ROOT"/docker/work/bashrc)"
@@ -286,8 +269,7 @@ for a in "up --recreat" "up -y --recreate" "down -y" "status x" "ps x" "gc x" "b
 done
 [ "$bad" -eq 0 ] && ok "引数の誤り (打ち間違い・コマンドの後ろのオプション・余分な引数) は終了コード 2" || ng "終了コード 2 にならないものが $bad 個"
 
-# 中継 (ssh_relay_start) は、この vpnsh の PID と開始時刻のラベルで work を探す。開始時刻を設定し忘れると、
-# どの work も見つからず「中継につながりませんでした」になる (実際に起きた)
+# 中継 (ssh_relay_start) が work を探すための開始時刻を設定していること
 if grep -q '^	SESSION_START="\$start"$' "$ROOT/bin/vpnsh" && grep -q 'label=vpnsh.start=\$SESSION_START' "$ROOT/bin/vpnsh"; then
 	ok "SSH の中継が work を探すための開始時刻を設定している"
 else

@@ -1,20 +1,10 @@
 #!/bin/bash
-# VPNShell: 専用 ssh-agent の確認ダイアログ (SSH_ASKPASS)
-#
-# vpnsh が起動する専用 ssh-agent だけが呼ぶ (環境変数 SSH_ASKPASS はそのプロセスにだけ与える。
-# macOS 全体の設定や、普段の ssh には影響しない)。ssh-add -c で登録した鍵が使われるたびに呼ばれる。
-#
-# 許可 (exit 0) するのは、ダイアログの結果が「許可ボタン」で、時間切れでもないときだけ。
-# それ以外 (拒否、時間切れ、エラー、想定外の出力、確認以外の問い合わせ) はすべて拒否 (exit 1)。
-#   ※ ssh-agent は askpass が「何も出力せず exit 0」だと許可として扱うので、終了コードだけで判定しない
-#   ※ osascript は時間切れでも exit 0 で "gave up:true" を返すので、結果の文字列で判定する
-# 結果は state/ssh-audit.log に記録する。
 set -u
 umask 077
 
 STATE="${VPNSH_STATE_DIR:-}"
 OSASCRIPT="/usr/bin/osascript"
-# テストのときだけ、ダイアログの代わりの偽物を使う (tests/ssh-test.sh)
+# テストのときだけ、ダイアログの代わりの偽物を使う
 if [ -n "${VPNSH_ASKPASS_TEST_OSASCRIPT:-}" ] && [ "${VPNSH_ASKPASS_TEST:-}" = "1" ]; then
 	OSASCRIPT="$VPNSH_ASKPASS_TEST_OSASCRIPT"
 fi

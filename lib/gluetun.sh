@@ -1,11 +1,9 @@
 # shellcheck shell=bash
-# gluetun コンテナの作成・状態確認・整合性の検査
 
 # .env から gluetun に渡す値 (コンテナの Env と照合して「未適用の変更」を検出する)
 GL_ENV_KEYS="WIREGUARD_ENDPOINT_IP WIREGUARD_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES WIREGUARD_MTU"
 
-# 安全のため「この値でなければならない」環境変数 (キルスイッチ、遮断の例外、DNS、制御用サーバー、デバッグ機能など)
-# gluetun のイメージはこれらを既定値つきで持っているので、「存在しないこと」ではなく値で判定する
+# 安全のため「この値でなければならない」環境変数 (イメージが既定値を持つので、値で判定する)
 GL_REQUIRED_ENV="
 FIREWALL_ENABLED_DISABLING_IT_SHOOTS_YOU_IN_YOUR_FOOT=on
 FIREWALL_OUTBOUND_SUBNETS=
@@ -35,8 +33,7 @@ gl_pinned_image() {
 	sed -n 's/^[[:space:]]*image:[[:space:]]*\(qmcgaw\/gluetun:[^[:space:]]*\)[[:space:]]*$/\1/p' "$VPNSH_ROOT/compose.yaml" | head -n 1
 }
 
-# gl_inspect  gluetun の状態を1回の docker inspect で取り、GL_* 変数に入れる
-# 戻り値: 0=存在する / 1=存在しない / 2=Docker に接続できない
+# gl_inspect  gluetun の状態を GL_* 変数に入れる (0=存在する / 1=存在しない / 2=Docker に接続できない)
 gl_inspect() {
 	local json errf rc
 	errf="$(mktemp "${TMPDIR:-/tmp}/vpnsh-insp.XXXXXX")"
@@ -122,8 +119,7 @@ EOF
 	return 0
 }
 
-# gl_expected_env  作成するときの Env の期待値を出す (固定したイメージの既定値に、compose.yaml の environment を上書き)
-# compose の出力にプロキシなど想定外のものが混ざらないよう、ここで組み立てた集合と作成後の Env の完全一致を求める
+# gl_expected_env  作成後の Env と完全一致すべき集合を出す (イメージの既定値に compose.yaml の environment を上書き)
 gl_expected_env() {
 	local ref img comp
 	ref="$(gl_pinned_image)"
@@ -175,7 +171,7 @@ gl_pending_changes() {
 		have="$(gl_env_value "$k")"
 		if [ "$want" != "$have" ]; then echo "$k"; found=0; fi
 	done
-	# compose.yaml の sysctl を変えたあと、作り直していない (例: ip_unprivileged_port_start を足す前に作った gluetun)
+	# compose.yaml の sysctl を変えたあと、作り直していない
 	if [ "${GL_SYSCTLS:-}" != "$GL_REQUIRED_SYSCTLS" ]; then echo "sysctls"; found=0; fi
 	# 遮断ルールのファイルが .env の値から作ったものと違う (値は検証してから埋め込む)
 	if ! rendered="$(fw_render "$VPNSH_ROOT/templates/post-rules.txt.tmpl" \
@@ -187,8 +183,7 @@ gl_pending_changes() {
 	return "$found"
 }
 
-# gl_verify_static  (gl_inspect の後) 起動していなくても確かめられること: イメージ、権限、マウント、Env
-# 期待値ファイル (作成時に組み立てた Env の集合) と完全一致すること
+# gl_verify_static  (gl_inspect の後) イメージ・権限・マウント・Env が作成時の記録と一致するか確かめる
 gl_verify_static() {
 	local bad=0 ref image_id
 	ref="$(gl_pinned_image)"
@@ -233,7 +228,6 @@ gl_verify() {
 }
 
 # gl_fw_check  (gl_inspect の後) ファイアウォールとルーティングを期待値と比べる
-# FW_* は fw_check が参照する
 # shellcheck disable=SC2034,SC2153
 gl_fw_check() {
 	local nv
@@ -248,8 +242,7 @@ gl_fw_check() {
 	fw_check "$VPNSH_GLUETUN_NAME" "$VPNSH_ROOT/templates/firewall-expected.txt"
 }
 
-# gl_create [--recreate]  キーチェーンから鍵を取り出して gluetun を作成する (ロックの中で呼ぶこと)
-# 手順: 作成 (起動しない) → 検査 → 記録 → 起動。検査に通らなければ起動せずに破棄する
+# gl_create [--recreate]  作成 → 検査 → 記録 → 起動の順で gluetun を作る (ロックの中で呼ぶこと)
 gl_create() {
 	local recreate="" key role apikey rc errf idf mine expected
 	[ "${1:-}" = "--recreate" ] && recreate="--force-recreate"
@@ -263,8 +256,7 @@ gl_create() {
 	errf="$(mktemp "${TMPDIR:-/tmp}/vpnsh-up.XXXXXX")"
 	# この呼び出しが作ったコンテナの ID (失敗したときに消してよいのは、これだけ)
 	idf="$(mktemp "${TMPDIR:-/tmp}/vpnsh-upid.XXXXXX")"
-	# 鍵は export せず、このサブシェルの docker compose にだけ渡す
-	# compose は secret を「起動するとき」にコピーするので、作成と起動の両方に渡す
+	# 鍵は export せず、このサブシェルの compose にだけ渡す (作成と起動の両方に必要)
 	(
 		VPNSH_WG_PRIVATE_KEY="$key"
 		VPNSH_CONTROL_DEFAULT_ROLE="$role"
@@ -288,8 +280,7 @@ gl_create() {
 		vpnsh_err "gluetun を作成できませんでした:"
 		vpnsh_sanitize <"$errf" | sed 's/^/    /' >&2
 		rm -f "$errf"
-		# 検査に通らなかった、または起動前に止まったコンテナは破棄する。
-		# 消すのは、この呼び出しが作ったと確かめたコンテナだけ (別の vpnsh が作ったものは壊さない)
+		# 検査に通らなかったコンテナは破棄する (この呼び出しが作ったと確かめたものだけ)
 		if [ -n "$mine" ]; then
 			vpnsh_docker rm -f "$mine" >/dev/null 2>&1
 			rm -f "$VPNSH_STATE_DIR/gluetun.id" "$VPNSH_STATE_DIR/gluetun.env"

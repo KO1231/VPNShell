@@ -1,30 +1,4 @@
 #!/usr/bin/perl
-# VPNShell: SSH エージェント中継の Mac 側
-#
-#   ssh-relay <コンテナID> <専用 ssh-agent のソケット> <docker context> [記録ファイル]
-#
-# docker exec -i でコンテナ側の中継 (/usr/local/lib/vpnsh/ssh-relay) を起動し、その標準入出力を
-# 1本のストリームとして使う。コンテナ側で ssh が接続するたびに「開く」の枠が来るので、
-# そのたびに専用 ssh-agent へ新しく接続する (1対1)。
-#
-# コンテナから専用 ssh-agent へ通す要求は、ssh が認証に使う3種類だけに絞る:
-#   11 鍵の一覧 / 13 署名 / 27 拡張のうち session-bind@openssh.com (接続先に縛った鍵 (-h) に必要)
-# それ以外 (鍵の追加・削除・ロック・スマートカードなど) は専用 ssh-agent に届けず、失敗 (5) を返してその接続を閉じる
-# (普段の ssh / git はこれらを送らない)。拒否の記録は、送り続けて Mac のディスクを埋められないよう件数を絞り、
-# 拒否が多すぎるときは中継を終える (シェルも閉じる)。
-# (コンテナ内のコードが自分の鍵を追加して確認ダイアログや記録を偽装したり、鍵を消したり
-#  ロックしたりするのを防ぐ)。承認の判断は ssh-agent の -c と確認ダイアログが行う。
-# 署名 (13) が失敗 (確認ダイアログで拒否・時間切れ) した回数も数え、短い間に続くか累計が多ければ中継を終える
-# (シェルも閉じる)。乗っ取られたシェルが確認ダイアログを出し続けて、うっかり「許可」を押させるのを防ぐ。
-# 専用 ssh-agent の応答は中身を変えずにそのまま転送し、数えるために読むだけにする。
-# - 署名の要求は、中継全体で1件ずつ専用 ssh-agent へ送る (前の署名の応答が返るまで、後の要求は中継の中で待たせる)。
-#   まとめて送られると ssh-agent はダイアログを続けて出し、失敗を数えられるのは全部終わった後になるため
-# - 応答の前に接続を閉じた署名の要求も失敗として数える (ssh-agent は接続が閉じてもダイアログを出し続けるので、
-#   数えないと、閉じるだけでダイアログを出し放題になる)
-# - ダイアログの出ない失敗 (接続先に縛った鍵を session-bind の無い接続で使った場合など) は数えない
-#   (ダイアログは session-bind 済みの接続でしか出ない。縛っていない鍵に備え、応答に時間がかかった失敗は数える)
-# docker exec は対象のコンテナにしか届かないので、ネットワークの遮断ルールに穴を開けない。
-# 枠の形式は docker/work/ssh-relay を参照。
 use strict;
 use warnings;
 no warnings 'uninitialized';
@@ -50,8 +24,7 @@ my $DENY_MAX = 1000;      # 1本の中継で拒否がこれを超えたら、中
 my $AUDIT_MAX = 1048576;  # 記録ファイルがこれを超えたら、1世代だけ残して入れ替える
 my ($denied, $suppressed, $last_summary) = (0, 0, time);
 my $SESSION_BIND = 'session-bind@openssh.com';
-# 署名の失敗が、直近 $SIGN_FAIL_WINDOW 秒の間に $SIGN_FAIL_MAX 回、または1本の中継の累計で
-# $SIGN_FAIL_TOTAL 回に達したら、中継を終える (間隔を空けて出し続けるのも防ぐ)
+# 署名の失敗が直近 $SIGN_FAIL_WINDOW 秒で $SIGN_FAIL_MAX 回、または累計 $SIGN_FAIL_TOTAL 回に達したら中継を終える
 my $SIGN_FAIL_MAX = 3;
 my $SIGN_FAIL_WINDOW = 300;
 my $SIGN_FAIL_TOTAL = 5;
@@ -74,9 +47,7 @@ $SIG{INT} = $done;
 
 my $sel = IO::Select->new($from);
 my (%conn, %id_of, %req);    # %req: 接続ごとの、コンテナから来た未処理のバイト列
-# 接続ごとの、専用 ssh-agent へ送って応答を待っている要求の種類 (1バイトずつ、送った順) と、
-# 専用 ssh-agent から来た未処理のバイト列 (応答は要求の順に1つずつ返る)、
-# 署名の要求を送った時刻 (送った順)、session-bind が成功した接続か
+# 接続ごとの、応答待ちの要求の種類・未処理の応答・署名を送った時刻・session-bind の成否
 my (%pend, %resp, %sent13, %bound);
 my $inflight13;    # 署名の応答を待っている接続の番号 (中継全体で1件まで)
 my @wait13;        # 署名の要求を送る順番を待っている接続の番号 (来た順)
@@ -192,8 +163,7 @@ sub filter_requests {
 	}
 }
 
-# sign_failed <理由>  署名の失敗を数え、直近 $SIGN_FAIL_WINDOW 秒で $SIGN_FAIL_MAX 回、
-# または累計 $SIGN_FAIL_TOTAL 回に達したら中継を終える
+# sign_failed <理由>  署名の失敗を数え、上限に達したら中継を終える
 sub sign_failed {
 	my ($why) = @_;
 	my $now = time;
@@ -207,8 +177,7 @@ sub sign_failed {
 	}
 }
 
-# watch_responses <番号> <データ>  専用 ssh-agent の応答を読み、確認ダイアログが出た署名 (13) の失敗 (5) を数える
-# (転送は呼び出し元がそのまま行う。ここでは読むだけ)
+# watch_responses <番号> <データ>  専用 ssh-agent の応答を読み、署名 (13) の失敗 (5) を数える (転送はしない)
 sub watch_responses {
 	my ($id, $b) = @_;
 	return unless exists $resp{$id};

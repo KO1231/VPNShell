@@ -1,5 +1,4 @@
 # shellcheck shell=bash
-# VPNShell 共通処理 (macOS の /bin/bash 3.2 で動くように書く: 連想配列・${x,,} などは使わない)
 
 # bin/vpnsh はこれらを上書きできないよう、読み込む前に unset する (テストだけが別の名前を使う)
 VPNSH_PROJECT="${VPNSH_PROJECT:-vpnshell}"
@@ -20,23 +19,16 @@ vpnsh_verbose() { [ -n "${VPNSH_VERBOSE:-}" ] && printf 'vpnsh: [詳細] %s\n' "
 # die <メッセージ> [終了コード]
 vpnsh_die() { vpnsh_err "$1"; exit "${2:-1}"; }
 
-# vpnsh_sanitize  (stdin → stdout) 端末の制御文字 (エスケープシーケンスなど) を取り除く
-# gluetun のログなど、外から来た文字列を端末に出すときに使う (タブと改行は残す)
+# vpnsh_sanitize  (stdin → stdout) 端末の制御文字を取り除く (タブと改行は残す)
 vpnsh_sanitize() { LC_ALL=C tr -d '\000-\010\013-\037\177'; }
-# vpnsh_visible  (stdin → stdout) 制御文字を消さずに ^[ のような見える形にする (人が確かめる差分の表示に使う。
-# 消すと「何かが隠されていた」ことに気づけないため。日本語などはそのまま残す)
+# vpnsh_visible  (stdin → stdout) 制御文字を ^[ のような見える形にする
 vpnsh_visible() { perl -pe 's/([\x00-\x08\x0b-\x1f\x7f])/"^" . chr(ord($1) ^ 64)/ge'; }
 
-# vpnsh_lc <文字列>  英字を小文字にして出す (bash 3.2 には ${v,,} が無いため)
-# tr は絶対パスで呼ぶ (vpnsh_safe_path は PATH を安全にする前に呼ばれるので、PATH から探すと偽物を使い得る)
+# vpnsh_lc <文字列>  英字を小文字にして出す (PATH を安全にする前にも呼ばれるので tr は絶対パスで呼ぶ)
 vpnsh_lc() { printf '%s' "$1" | LC_ALL=C /usr/bin/tr '[:upper:]' '[:lower:]'; }
 
 # ---- PATH を安全にする ----
-# vpnsh_safe_path <マウントできる場所の根元>  PATH から、マウントできる場所の配下・相対パス・存在しないものを除き、
-# /usr/bin などを必ず含めたものを出す。シェルの中のコードは --mount-cwd-rw でマウントしたディレクトリに書けるので、
-# そこが PATH に入っていると (direnv の PATH_add、node_modules/.bin など)、偽の docker などに秘密鍵を渡してしまうため
-# APFS は既定で大文字・小文字を区別しないので (~/projects も ~/Projects を指す)、パスは小文字にそろえて比べる
-# (区別するボリュームでは除く範囲が広がるだけなので、安全側に倒れる)
+# vpnsh_safe_path <マウントできる場所の根元>  PATH からマウントできる場所の配下・相対パス・存在しないものを除いて出す (大文字・小文字は区別しない)
 vpnsh_safe_path() {
 	local root="$1" new="" d real lroot lhome IFS=:
 	root="$(cd -P "$root" 2>/dev/null && pwd)" || root="$1"
@@ -59,10 +51,7 @@ vpnsh_safe_path() {
 }
 
 # ---- 環境変数の掃除 ----
-# compose や docker の対象・値が Mac のシェルの環境変数で変わらないようにする
-# - COMPOSE_* / DOCKER_* / BUILDX_* / BUILDKIT_*: 対象のプロジェクト・ファイル・ビルダーを変え得る
-#   (COMPOSE_PROJECT_NAME は name: より優先され、COMPOSE_FILE は override を注入できる)
-# - compose.yaml の変数展開に使う名前: シェルの環境変数は .env より優先されるため
+# compose や docker の対象・値を変え得る環境変数 (COMPOSE_* / DOCKER_* など、compose.yaml の変数名) を消す
 VPNSH_COMPOSE_VARS="WIREGUARD_ENDPOINT_IP WIREGUARD_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES WIREGUARD_MTU EXPECTED_PUBLIC_IP VPNSH_IP_CHECK_URLS VPNSH_GLUETUN_NAME VPNSH_STATE_DIR VPNSH_UID VPNSH_GID VPNSH_TZ VPNSH_BUILD_HASH VPNSH_WG_PRIVATE_KEY VPNSH_CONTROL_DEFAULT_ROLE"
 vpnsh_clean_env() {
 	local v
@@ -101,8 +90,8 @@ vpnsh_timing() {
 	VPNSH_T_LAST="$now"
 }
 
-# ---- 時間制限 (macOS には timeout(1) が無いので perl の alarm を使う) ----
-# vpnsh_timeout <秒> <コマンド...>  時間切れなら 124 を返す
+# ---- 時間制限 ----
+# vpnsh_timeout <秒> <コマンド...>  perl の alarm で時間制限を付ける (時間切れなら 124)
 vpnsh_timeout() {
 	local secs="$1"; shift
 	perl -e '
@@ -132,8 +121,7 @@ vpnsh_compose_t() {
 		"$@"
 }
 
-# vpnsh_compose <args...>  (時間制限なし: run や build は長くかかり得る)
-# VPNSH_ROOT と VPNSH_ENV_FILE が設定済みであること
+# vpnsh_compose <args...>  時間制限なしの compose (VPNSH_ROOT と VPNSH_ENV_FILE が設定済みであること)
 vpnsh_compose() {
 	command docker --context "$VPNSH_CONTEXT" compose \
 		-p "$VPNSH_PROJECT" \
@@ -147,8 +135,7 @@ vpnsh_compose() {
 vpnsh_proc_start() { LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' '_' | sed 's/^_//;s/_$//'; }
 
 # ---- .env の読み込み ----
-# 書式は厳密に「KEY=VALUE」だけ (export、引用符、コメント行以外の #、$、空白、バックスラッシュは不可)。
-# vpnsh が読む値と compose の解釈が食い違わないようにするため。
+# 書式は厳密に「KEY=VALUE」だけ (vpnsh と compose の解釈が食い違わないように)
 VPNSH_ENV_LOADED=""
 VPNSH_ENV_TEXT=""
 vpnsh_env_load() {
@@ -181,8 +168,7 @@ EOF
 	printf '%s' "$val"
 }
 
-# vpnsh_table [字下げ]  (stdin: タブ区切りの行 → stdout: 列を揃えた表)
-# 全角の文字は幅 2 として数える (printf はバイト数で数えるので日本語でずれるため)
+# vpnsh_table [字下げ]  (stdin: タブ区切りの行 → stdout: 列を揃えた表。全角は幅 2 で数える)
 vpnsh_table() {
 	VPNSH_TABLE_INDENT="${1:-}" perl -CSD -e '
 		sub w { my $n = 0; for (split //, $_[0]) { $n += (ord($_) >= 0x1100 && (ord($_) <= 0x115F || (ord($_) >= 0x2E80 && ord($_) <= 0xA4CF) || (ord($_) >= 0xAC00 && ord($_) <= 0xD7A3) || (ord($_) >= 0xF900 && ord($_) <= 0xFAFF) || (ord($_) >= 0xFE30 && ord($_) <= 0xFE4F) || (ord($_) >= 0xFF00 && ord($_) <= 0xFF60) || (ord($_) >= 0xFFE0 && ord($_) <= 0xFFE6))) ? 2 : 1 } $n }

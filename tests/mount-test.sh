@@ -1,9 +1,5 @@
 #!/bin/bash
 # shellcheck disable=SC2015  # ok / ng は常に 0 を返すので A && B || C で問題ない
-# マウントの安全策 (lib/mount.sh の mnt_check) の単体テスト。Docker は使わない。
-# 一時ディレクトリに「許可するディレクトリ」「偽の VPNShell リポジトリ」などを作って判定を確かめる。
-#
-# 使い方: tests/mount-test.sh
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"

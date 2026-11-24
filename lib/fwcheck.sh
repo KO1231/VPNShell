@@ -1,10 +1,4 @@
 # shellcheck shell=bash
-# gluetun のファイアウォールとルーティングの生成と検査
-#
-# - post-rules をテンプレートから生成する
-# - gluetun 内の iptables (filter / nat / mangle / raw)、ip6tables、legacy、ip rule / ip route を
-#   1回の docker exec で取得し、毎回変わる値だけを正規化して、templates/firewall-expected.txt と比べる
-#   (先頭に挿入した VPNShell のルールは順序どおり、それ以外は集合として)
 
 FW_IPV4_RE='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 
@@ -25,8 +19,7 @@ fw_render_post_rules() {
 	chmod 0644 "$tmp" && mv -f "$tmp" "$2"
 }
 
-# fw_dump <コンテナ名>
-# gluetun 内で各表を出力する。先頭行に gluetun の PID 1 のネットワーク名前空間を出す
+# fw_dump <コンテナ名>  gluetun 内の各表を出力する (先頭行は PID 1 のネットワーク名前空間)
 fw_dump() {
 	vpnsh_timeout 10 docker --context "$VPNSH_CONTEXT" exec "$1" sh -c '
 		echo "## netns $(readlink /proc/1/ns/net)"
@@ -46,9 +39,7 @@ fw_dump() {
 	'
 }
 
-# fw_normalize  (stdin → stdout)
-# 環境変数 FW_ETH_IP / FW_SUBNET / FW_BCAST / FW_GW / FW_EP_IP / FW_EP_PORT / FW_WG_ADDR の値を
-# @@...@@ に置き換える。IP は前後が数字やドットでない位置だけを置き換える (部分一致を防ぐ)
+# fw_normalize  (stdin → stdout) FW_* の値を @@...@@ に置き換える (部分一致は置き換えない)
 fw_normalize() {
 	perl -ne '
 		next if /^## netns /;
@@ -75,9 +66,7 @@ fw_normalize() {
 # fw_netns_from_dump  (stdin: fw_dump の出力) → "net:[...]"
 fw_netns_from_dump() { sed -n 's/^## netns //p' | head -n 1; }
 
-# fw_canonical (stdin → stdout)
-# 比べ方: 先頭に挿入した VPNShell のルール (期待値ファイルで '= ' 付き) は順序どおり、
-# それ以外の行は集合として比べる (gluetun が再接続で末尾の許可を付け外ししても、順序の揺れで誤判定しない)
+# fw_canonical  (stdin → stdout) '= ' 付きの行は順序どおり、それ以外は集合として比べられる形にする
 fw_canonical() {
 	perl -e '
 		my ($sec, %rows, @order);
@@ -97,9 +86,7 @@ fw_canonical() {
 	'
 }
 
-# fw_mark_fixed <期待値ファイル>  (stdin: 正規化済みの dump)
-# 期待値ファイルで、あるセクションのあるチェーンに '= -A <CHAIN> ...' が N 本あれば、
-# 実際のそのチェーンの -A 行の先頭 N 本に '= ' を付ける
+# fw_mark_fixed <期待値ファイル>  (stdin: 正規化済みの dump) 期待値で '= ' 付きの本数だけ、実際のチェーンの先頭の行に '= ' を付ける
 fw_mark_fixed() {
 	FW_EXPECTED="$1" perl -e '
 		my (%n, $sec);
@@ -122,9 +109,7 @@ fw_mark_fixed() {
 	'
 }
 
-# fw_check <コンテナ名> <期待値ファイル>
-# 呼ぶ前に FW_ETH_IP / FW_SUBNET / FW_BCAST / FW_GW / FW_EP_IP / FW_EP_PORT / FW_WG_ADDR を設定すること
-# 一致すれば 0。不一致なら差分を stderr に出して 1。成功時は FW_NETNS に gluetun の名前空間を入れる
+# fw_check <コンテナ名> <期待値ファイル>  一致すれば 0 (FW_NETNS を設定)、不一致なら差分を stderr に出して 1
 fw_check() {
 	local name="$1" expected="$2" dump v
 	for v in "$FW_ETH_IP" "$FW_GW" "$FW_BCAST" "$FW_EP_IP" "$FW_WG_ADDR"; do
