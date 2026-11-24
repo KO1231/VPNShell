@@ -1,0 +1,101 @@
+#!/bin/bash
+# VPNShell: 専用 ssh-agent の確認ダイアログ (SSH_ASKPASS)
+#
+# vpnsh が起動する専用 ssh-agent だけが呼ぶ (環境変数 SSH_ASKPASS はそのプロセスにだけ与える。
+# macOS 全体の設定や、普段の ssh には影響しない)。ssh-add -c で登録した鍵が使われるたびに呼ばれる。
+#
+# 許可 (exit 0) するのは、ダイアログの結果が「許可ボタン」で、時間切れでもないときだけ。
+# それ以外 (拒否、時間切れ、エラー、想定外の出力、確認以外の問い合わせ) はすべて拒否 (exit 1)。
+#   ※ ssh-agent は askpass が「何も出力せず exit 0」だと許可として扱うので、終了コードだけで判定しない
+#   ※ osascript は時間切れでも exit 0 で "gave up:true" を返すので、結果の文字列で判定する
+# 結果は state/ssh-audit.log に記録する。
+set -u
+umask 077
+
+STATE="${VPNSH_STATE_DIR:-}"
+OSASCRIPT="/usr/bin/osascript"
+# テストのときだけ、ダイアログの代わりの偽物を使う (tests/ssh-test.sh)
+if [ -n "${VPNSH_ASKPASS_TEST_OSASCRIPT:-}" ] && [ "${VPNSH_ASKPASS_TEST:-}" = "1" ]; then
+	OSASCRIPT="$VPNSH_ASKPASS_TEST_OSASCRIPT"
+fi
+TIMEOUT=20
+if [ "${VPNSH_ASKPASS_TEST:-}" = "1" ] && [ -n "${VPNSH_ASKPASS_TEST_TIMEOUT:-}" ]; then
+	TIMEOUT="$VPNSH_ASKPASS_TEST_TIMEOUT"
+fi
+
+prompt="${1:-}"
+clean() { printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013-\037\177' | cut -c1-300; }
+
+log() {
+	[ -n "$STATE" ] && [ -d "$STATE" ] || return 0
+	printf '%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "${fp:-?}" "${server:-?}" >>"$STATE/ssh-audit.log" 2>/dev/null
+	return 0
+}
+
+# 文言に含まれる指紋は、ちょうど1つでなければならない (鍵のコメントに指紋を書いて偽装するのを防ぐ)
+fps="$(printf '%s' "$prompt" | grep -oE 'SHA256:[A-Za-z0-9+/]{43}' | sort -u)"
+fp="$(printf '%s\n' "$fps" | head -n 1)"
+user="$(printf '%s' "$prompt" | sed -n 's/.*for user "\([^"]*\)".*/\1/p' | tail -n 1)"
+user="$(clean "$user")"
+server=""
+
+# 確認以外の問い合わせ (パスフレーズの入力など) には答えない
+if [ "${SSH_ASKPASS_PROMPT:-}" != "confirm" ]; then
+	log "deny(not-confirm)"
+	exit 1
+fi
+if [ "$(printf '%s\n' "$fps" | grep -c .)" -ne 1 ]; then
+	log "deny(fingerprint-count)"
+	exit 1
+fi
+# 指紋が vpnsh で登録した鍵のものでなければ、ダイアログを出さずに拒否する
+if [ -z "$STATE" ] || [ ! -r "$STATE/ssh/fingerprints" ] || ! awk -v f="$fp" '$1 == f { found = 1 } END { exit !found }' "$STATE/ssh/fingerprints"; then
+	log "deny(unknown-key)"
+	exit 1
+fi
+# 同じ鍵を複数の接続先で使う場合は、ユーザー名で絞ったうえで候補をすべて表示する
+server="$(awk -v f="$fp" -v u="$user" '
+	$1 == f {
+		$1 = ""; sub(/^ /, "")
+		all = all (all == "" ? "" : " / ") $0
+		if (u != "" && index($0, "(" u "@") > 0) hit = hit (hit == "" ? "" : " / ") $0
+	}
+	END { print (hit != "" ? hit : all) }' "$STATE/ssh/fingerprints")"
+server="$(clean "$server")"
+
+msg="VPNShell のコンテナから SSH 鍵の使用要求があります。
+
+サーバー: ${server:-不明}
+ユーザー: ${user:-不明}
+鍵: ${fp:-不明}
+
+自分が今この操作 (ssh / git など) をしていないなら「拒否」を押してください。
+続けて何度も出る場合も、すべて拒否してください。
+(${TIMEOUT} 秒で自動的に拒否します)"
+
+# 文言は引数で渡す (AppleScript の文字列に埋め込まない)。外側でも時間制限を付ける
+result="$(perl -e 'alarm shift; exec @ARGV or exit 127' $((TIMEOUT + 5)) "$OSASCRIPT" - "$msg" "$TIMEOUT" 2>/dev/null <<'APPLESCRIPT'
+on run argv
+	set m to item 1 of argv
+	set t to (item 2 of argv) as integer
+	try
+		set r to display dialog m with title "VPNShell SSH" buttons {"拒否", "許可"} default button "拒否" cancel button "拒否" with icon caution giving up after t
+		return "button=" & (button returned of r) & ";gaveup=" & (gave up of r)
+	on error number n
+		return "error=" & n
+	end try
+end run
+APPLESCRIPT
+)"
+rc=$?
+
+if [ "$rc" -eq 0 ] && [ "$result" = "button=許可;gaveup=false" ]; then
+	log "allow"
+	exit 0
+fi
+case "$result" in
+	*"gaveup=true"*) log "deny(timeout)" ;;
+	"error=-128") log "deny(button)" ;;
+	*) log "deny(other:$(clean "$result" | cut -c1-40);rc=$rc)" ;;
+esac
+exit 1
