@@ -62,6 +62,9 @@ jobs:
       - name: zsh completion syntax
         run: zsh -n completions/_vpnsh
 
+      - name: Perl syntax with the macOS perl (SSH relay)
+        run: /usr/bin/perl -c scripts/ssh-relay
+
       - name: Unit tests
         run: /bin/bash tests/unit-test.sh
 
