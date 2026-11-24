@@ -260,7 +260,7 @@ gc_orphans() {
 	local id pid start st n=0
 	while read -r id pid start st; do
 		[ "$st" = "orphan" ] || continue
-		vpnsh_docker kill -s HUP "$id" >/dev/null 2>&1 || vpnsh_docker rm -f "$id" >/dev/null 2>&1
+		vpnsh_docker kill -s HUP "$id" >/dev/null 2>&1 || vpnsh_docker rm -f -v "$id" >/dev/null 2>&1
 		n=$((n + 1))
 	done <<EOF
 $(work_list)
