@@ -298,9 +298,50 @@ gl_create() {
 	return 0
 }
 
+# 外部IPの確認サービスの既定値
+GL_IP_CHECK_URLS_DEFAULT="https://1.1.1.1/cdn-cgi/trace https://api.ipify.org https://checkip.amazonaws.com"
+
+# gl_host_vpn_routed  Mac から VPN の接続先へのパケットが Mac の VPN (utun) に入るなら 0
+gl_host_vpn_routed() {
+	local ip
+	ip="$(vpnsh_env_get WIREGUARD_ENDPOINT_IP)"
+	[ -n "$ip" ] || return 1
+	/sbin/route -n get "$ip" 2>/dev/null | awk '$1 == "interface:" && $2 ~ /^utun[0-9]+$/ { f = 1 } END { exit !f }'
+}
+
+# gl_mac_public_ip  Mac の外部IPを確認サービスに順に問い合わせ、最初に読み取れたものを出す (どこからも読み取れなければ 1)
+gl_mac_public_ip() {
+	local urls url body ip
+	urls="$(vpnsh_env_get VPNSH_IP_CHECK_URLS)"
+	for url in ${urls:-$GL_IP_CHECK_URLS_DEFAULT}; do
+		body="$(/usr/bin/curl -q -4 -sS --connect-timeout 2 --max-time 3 "$url" 2>/dev/null)" || continue
+		ip="$(printf '%s\n' "$body" | sed -n 's/^ip=//p' | head -n 1)"
+		[ -n "$ip" ] || ip="$(printf '%s\n' "$body" | head -n 1 | tr -d ' \r\t')"
+		fw_is_ipv4 "$ip" && { printf '%s' "$ip"; return 0; }
+	done
+	return 1
+}
+
+# gl_host_vpn_state  Mac の外部IPが専用IPなら same、Mac の VPN を通るが外部IPを確かめられなければ unknown を出す
+gl_host_vpn_state() {
+	local ip
+	gl_host_vpn_routed || return 0
+	ip="$(gl_mac_public_ip)" || { echo unknown; return 0; }
+	[ "$ip" = "$(vpnsh_env_get EXPECTED_PUBLIC_IP)" ] && echo same
+	return 0
+}
+
+# gl_host_vpn_confirm  警告を出し、端末があれば続けるか確かめる (やめるなら 1)
+gl_host_vpn_confirm() {
+	vpnsh_warn "Mac の外部IPが専用IP ($(vpnsh_env_get EXPECTED_PUBLIC_IP)) です。NordVPN アプリなどで専用IPのサーバーに接続している間は、vpnsh はつながりません (アプリを切断するか、別のサーバーに接続してください)"
+	[ -n "${VPNSH_YES:-}" ] && return 0
+	{ [ -t 0 ] && [ -r /dev/tty ]; } || return 0
+	confirm "続行しますか?"
+}
+
 # gl_wait_healthy <秒>  healthy になるまで 0.5 秒ごとに確認する
 gl_wait_healthy() {
-	local limit="$1" i=0 max shown=""
+	local limit="$1" i=0 max shown="" host_vpn=""
 	max=$((limit * 2))
 	while :; do
 		gl_inspect || return 1
@@ -311,6 +352,10 @@ gl_wait_healthy() {
 			return 1
 		fi
 		if [ -z "$shown" ]; then
+			host_vpn="$(gl_host_vpn_state)"
+			if [ "$host_vpn" = "same" ]; then
+				gl_host_vpn_confirm || return 1
+			fi
 			printf 'vpnsh: VPN の接続を待っています (最大 %s 秒。スリープ復帰直後は時間がかかることがあります) ' "$limit" >&2
 			shown=1
 		fi
