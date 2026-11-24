@@ -27,20 +27,28 @@ vpnsh_sanitize() { LC_ALL=C tr -d '\000-\010\013-\037\177'; }
 # 消すと「何かが隠されていた」ことに気づけないため。日本語などはそのまま残す)
 vpnsh_visible() { perl -pe 's/([\x00-\x08\x0b-\x1f\x7f])/"^" . chr(ord($1) ^ 64)/ge'; }
 
+# vpnsh_lc <文字列>  英字を小文字にして出す (bash 3.2 には ${v,,} が無いため)
+# tr は絶対パスで呼ぶ (vpnsh_safe_path は PATH を安全にする前に呼ばれるので、PATH から探すと偽物を使い得る)
+vpnsh_lc() { printf '%s' "$1" | LC_ALL=C /usr/bin/tr 'A-Z' 'a-z'; }
+
 # ---- PATH を安全にする ----
 # vpnsh_safe_path <マウントできる場所の根元>  PATH から、マウントできる場所の配下・相対パス・存在しないものを除き、
 # /usr/bin などを必ず含めたものを出す。シェルの中のコードは --mount-cwd-rw でマウントしたディレクトリに書けるので、
 # そこが PATH に入っていると (direnv の PATH_add、node_modules/.bin など)、偽の docker などに秘密鍵を渡してしまうため
+# APFS は既定で大文字・小文字を区別しないので (~/projects も ~/Projects を指す)、パスは小文字にそろえて比べる
+# (区別するボリュームでは除く範囲が広がるだけなので、安全側に倒れる)
 vpnsh_safe_path() {
-	local root="$1" new="" d real IFS=:
+	local root="$1" new="" d real lroot lhome IFS=:
 	root="$(cd -P "$root" 2>/dev/null && pwd)" || root="$1"
+	lroot="$(vpnsh_lc "$root")"
+	lhome="$(vpnsh_lc "$HOME")"
 	for d in $PATH; do
 		case "$d" in /*) ;; *) continue ;; esac
 		[ -d "$d" ] || continue
 		# ホームの配下だけ、シンボリックリンクを解決して確かめる (それ以外は数が多いので、そのまま比べる)
 		real="$d"
-		case "$d" in "$HOME"/*) real="$(cd -P "$d" 2>/dev/null && pwd)" || continue ;; esac
-		case "$real/" in "$root/"*) continue ;; esac
+		case "$(vpnsh_lc "$d")" in "$lhome"/*) real="$(cd -P "$d" 2>/dev/null && pwd)" || continue ;; esac
+		case "$(vpnsh_lc "$real")/" in "$lroot/"*) continue ;; esac
 		case ":$new:" in *":$d:"*) continue ;; esac
 		new="${new:+$new:}$d"
 	done
