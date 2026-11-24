@@ -227,7 +227,10 @@ echo allow >"$T/askpass-mode"
 cat >"$T/fake-askpass" <<EOF
 #!/bin/bash
 echo "\$(date +%s) \$*" >> "$T/askpass-calls"
-[ "\$(cat "$T/askpass-mode")" = "allow" ]
+mode="\$(cat "$T/askpass-mode")"
+# slow: 人がダイアログを読んでから拒否したときのように、時間をかけて拒否する
+[ "\$mode" = "slow" ] && sleep 2
+[ "\$mode" = "allow" ]
 EOF
 chmod +x "$T/fake-askpass"
 out="$(env -i HOME="$HOME" PATH=/usr/bin:/bin SSH_ASKPASS="$T/fake-askpass" SSH_ASKPASS_REQUIRE=force /usr/bin/ssh-agent -s -a "$AGENT_SOCK" -P none)"
@@ -391,6 +394,103 @@ while kill -0 "$RELAY_PID" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.2; i=$((i 
 kill -0 "$RELAY_PID" 2>/dev/null && ng "拒否が1000件を超えても中継が続いた" || ok "拒否が1000件を超えると中継を終える (シェルも閉じる)"
 grep -q 'too-many' "$T/state/ssh-audit.log" && ok "そのことを記録する" || ng "中継を終えたことが記録されない"
 end_ssh
+
+echo "== 2i. 署名の拒否・時間切れが続けば中継を終える (確認ダイアログの連打を防ぐ)"
+# 2g で鍵を消したので登録し直す
+SSH_AUTH_SOCK="$AGENT_SOCK" /usr/bin/ssh-add -q -c -t 10m -H "$T/state/known_hosts" -h "tester@[127.0.0.1]:2222" "$T/id_test" 2>/dev/null
+run_ssh 'true'
+echo deny >"$T/askpass-mode"
+# 確認の文言は複数行なので、呼ばれた回数は先頭行 (Allow use of key) で数える
+before="$(grep -c 'Allow use of key' "$T/askpass-calls")"
+in_c "ssh $NOCM srv1 true; ssh $NOCM srv1 true" >/dev/null
+after="$(grep -c 'Allow use of key' "$T/askpass-calls")"
+sleep 1
+[ $((after - before)) -eq 2 ] && kill -0 "$RELAY_PID" 2>/dev/null &&
+	ok "署名の失敗が2回までなら中継は続く" || ng "署名の失敗2回で中継が止まった (確認 $((after - before)) 回)"
+in_c "ssh $NOCM srv1 true" >/dev/null
+i=0
+while kill -0 "$RELAY_PID" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+kill -0 "$RELAY_PID" 2>/dev/null && ng "署名の失敗が3回続いても中継が続いた" || ok "署名の失敗が5分以内に3回になると中継を終える (シェルも閉じる)"
+grep -q 'sign-failed-too-often' "$T/state/ssh-audit.log" && ok "そのことを記録する" || ng "署名の失敗で中継を終えたことが記録されない"
+echo allow >"$T/askpass-mode"
+end_ssh
+
+echo "== 2j. 応答の前に接続を閉じても数える・ダイアログの出ない失敗は数えない"
+# 署名の要求 (13) を直接送る。close: 送ってすぐ閉じる / wait: 応答の種類を出す
+cat >"$T/sign13.pl" <<'EOF'
+use strict; use IO::Socket::UNIX; use Socket qw(SOCK_STREAM); use MIME::Base64;
+# pipe <N>: 1本の接続に N 件をまとめて送る / multi <N>: N 本の接続で1件ずつ同時に送る (どちらも応答は待たない)
+my ($pub, $mode, $n) = @ARGV;
+my $blob = decode_base64((split ' ', $pub)[1]);
+my $p = chr(13) . pack("N/a*", $blob) . pack("N/a*", "vpnsh-test-data") . pack("N", 0);
+my $req = pack("N", length $p) . $p;
+my $open = sub { IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $ENV{SSH_AUTH_SOCK}) or die "connect: $!" };
+if ($mode eq "pipe") { my $s = $open->(); syswrite($s, $req x $n); sleep 60; exit 0; }
+if ($mode eq "multi") { my @s = map { my $s = $open->(); syswrite($s, $req); $s } 1 .. $n; sleep 60; exit 0; }
+my $s = $open->();
+syswrite($s, $req);
+if ($mode eq "close") { select(undef, undef, undef, 0.2); close $s; exit 0; }
+my $n = read($s, my $h, 5);
+print $n == 5 ? "resp=" . ord(substr($h, 4, 1)) . "\n" : "closed\n";
+EOF
+# 接続先に縛っていない、確認付きの鍵 (session-bind の無い接続でもダイアログが出る)
+ssh-keygen -q -t ed25519 -N '' -C vpnsh-test-key2 -f "$T/id_test2"
+SSH_AUTH_SOCK="$AGENT_SOCK" /usr/bin/ssh-add -q -c -t 10m "$T/id_test2" 2>/dev/null
+run_ssh 'true'
+vpnsh_docker exec -i "$CID" sh -c 'cat > /tmp/sign13.pl' <"$T/sign13.pl"
+PUB1="$(cat "$T/id_test.pub")"; PUB2="$(cat "$T/id_test2.pub")"
+# 接続先に縛った鍵を session-bind の無い接続で使う (コミットの署名など)。ダイアログを出さずに失敗する
+echo deny >"$T/askpass-mode"
+before="$(grep -c 'Allow use of key' "$T/askpass-calls")"
+out="$(in_c "for i in 1 2 3 4; do perl /tmp/sign13.pl '$PUB1' wait; done")"
+after="$(grep -c 'Allow use of key' "$T/askpass-calls")"
+sleep 1
+[ "$(printf '%s\n' "$out" | grep -c '^resp=5$')" -eq 4 ] && [ "$before" = "$after" ] && kill -0 "$RELAY_PID" 2>/dev/null &&
+	ok "ダイアログの出ない署名の失敗は数えない (4回失敗しても中継は続く)" || ng "ダイアログの出ない失敗で中継が止まった: $out (確認 $((after - before)) 回)"
+end_ssh
+# 縛っていない鍵で署名を要求し、ダイアログが出ている間に接続を閉じる (新しい中継で試す)
+run_ssh 'true'
+vpnsh_docker exec -i "$CID" sh -c 'cat > /tmp/sign13.pl' <"$T/sign13.pl"
+echo slow >"$T/askpass-mode"
+in_c "for i in 1 2 3; do perl /tmp/sign13.pl '$PUB2' close; done" >/dev/null
+i=0
+while kill -0 "$RELAY_PID" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.2; i=$((i + 1)); done
+kill -0 "$RELAY_PID" 2>/dev/null && ng "応答の前に接続を閉じると、署名の失敗が数えられない" || ok "応答の前に接続を閉じた署名の要求も失敗として数える (3回で中継を終える)"
+grep -q 'sign-failed;closed-before-response' "$T/state/ssh-audit.log" && ok "そのことを記録する" || ng "応答の前に閉じた署名の要求が記録されない"
+# 専用 ssh-agent が残りのダイアログを終えるのを待ってから次へ (偽のダイアログは1回2秒)
+sleep 7
+end_ssh
+
+echo "== 2k. 署名の要求をまとめて送っても、ダイアログは1件ずつ出し、3回で止める"
+# askpass_settled  専用 ssh-agent が確認ダイアログを出し終えるまで待ち、それまでの回数を出す
+askpass_settled() {
+	local prev=-1 cur i=0
+	while [ "$i" -lt 20 ]; do
+		cur="$(grep -c 'Allow use of key' "$T/askpass-calls")"
+		[ "$cur" = "$prev" ] && break
+		prev="$cur"; sleep 3; i=$((i + 1))
+	done
+	printf '%s' "$cur"
+}
+for how in pipe multi; do
+	run_ssh 'true'
+	vpnsh_docker exec -i "$CID" sh -c 'cat > /tmp/sign13.pl' <"$T/sign13.pl"
+	before="$(askpass_settled)"
+	in_c "perl /tmp/sign13.pl '$PUB2' $how 6" >/dev/null 2>&1 &
+	bg=$!
+	i=0
+	while kill -0 "$RELAY_PID" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i + 1)); done
+	stopped="yes"; kill -0 "$RELAY_PID" 2>/dev/null && stopped="no"
+	after="$(askpass_settled)"
+	kill "$bg" 2>/dev/null; wait "$bg" 2>/dev/null
+	case "$how" in pipe) what="1本の接続にまとめて6件" ;; *) what="6本の接続で同時に" ;; esac
+	[ "$stopped" = "yes" ] && [ $((after - before)) -eq 3 ] &&
+		ok "署名の要求を${what}送っても、ダイアログは3回だけ出て中継を終える" ||
+		ng "署名の要求を${what}送ったとき: 中継の停止 ${stopped}、ダイアログ $((after - before)) 回 (期待値: yes、3 回)"
+	end_ssh
+done
+echo allow >"$T/askpass-mode"
+SSH_AUTH_SOCK="$AGENT_SOCK" /usr/bin/ssh-add -q -d "$T/id_test2.pub" 2>/dev/null
 ssh_session_remove "$SESSION"
 [ ! -d "$SESSION" ] && ok "シェル専用の設定を片付けられる" || ng "シェル専用の設定が残った"
 

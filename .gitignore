@@ -1,5 +1,8 @@
 # 機密・環境依存
 .env
+# .env を書き換えるときの一時ファイル (.env.tmp.<PID>。書き換えの途中で強制終了されると残る)
+.env.*
+!.env.example
 *.conf
 # 秘密を含まないテンプレートだけは管理する
 !templates/work-resolv.conf

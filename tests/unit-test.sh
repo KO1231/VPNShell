@@ -56,6 +56,37 @@ out="$(HOME="$T/home" PATH="$T/home/Projects/app/bin:./node_modules/.bin::$T/hom
 case ":$out:" in *"Projects"* | *":./"* | *"::"* | *"linked-bin"* | *nonexistent*) ng "残ってはいけないものが PATH に残った: $out" ;; *) ok "マウントできる場所の配下・相対パス・空・存在しない・シンボリックリンク経由のものを除く" ;; esac
 case ":$out:" in *":$T/home/bin:$T/other:"*) ok "それ以外は順序を保って残す" ;; *) ng "残すべきものが消えた: $out" ;; esac
 case ":$out:" in *":/usr/bin:/bin:/usr/sbin:/sbin:"*) ok "/usr/bin などを必ず含める" ;; *) ng "/usr/bin などが無い: $out" ;; esac
+# vpnsh は PATH を安全にするまで、元の PATH からコマンドを探さない
+# (mount-root の配下はコンテナから書き換えられるので、そこに置かれた偽の dirname などが Mac 側で動かないように)
+# 実際の .env (mount-root の設定など) に左右されないよう、bin と lib を .env の無い場所にコピーして起動する
+mkdir -p "$T/home4/Projects/app/bin" "$T/bin4" "$T/repo4"
+cp -R "$ROOT/bin" "$ROOT/lib" "$T/repo4/"
+for c in dirname readlink env sed cat tr grep awk perl; do
+	printf '#!/bin/sh\n/usr/bin/touch "%s/fake-called-%s"\nexec /usr/bin/%s "$@"\n' "$T" "$c" "$c" >"$T/home4/Projects/app/bin/$c"
+	chmod +x "$T/home4/Projects/app/bin/$c"
+done
+ln -s "$T/repo4/bin/vpnsh" "$T/bin4/vpnsh"
+out="$(HOME="$T/home4" PATH="$T/home4/Projects/app/bin:$PATH" "$T/bin4/vpnsh" --version 2>&1)"
+called=""
+for f in "$T"/fake-called-*; do [ -e "$f" ] && called="$called${f##*/} "; done
+[ -z "$called" ] && [ "$out" = "vpnsh $(sed -n 's/^VPNSH_VERSION="\(.*\)"$/\1/p' "$ROOT/bin/vpnsh")" ] &&
+	ok "PATH を安全にする前に、元の PATH (マウントできる場所の配下) のコマンドを使わない" ||
+	ng "元の PATH の偽のコマンドが呼ばれた: ${called:-なし} (出力: $out)"
+# CDPATH が export されていても、相対パス (bin/vpnsh) で起動したときにリポジトリの場所を取り違えない
+mkdir -p "$T/cdpath5/bin"
+out="$(cd "$T/repo4" && HOME="$T/home4" CDPATH="$T/cdpath5" bin/vpnsh --version 2>&1)"
+[ "$out" = "vpnsh $(sed -n 's/^VPNSH_VERSION="\(.*\)"$/\1/p' "$ROOT/bin/vpnsh")" ] &&
+	ok "CDPATH があっても、リポジトリの場所を取り違えない" || ng "CDPATH でリポジトリの場所を取り違えた: $out"
+# 大文字・小文字を区別しないファイルシステム (APFS の既定) では、綴りを変えてもマウントできる場所の配下を指せる。
+# 区別するファイルシステムでも判定を通すよう、小文字の綴りのディレクトリを実際に作って試す
+mkdir -p "$T/home2/projects/app/bin" "$T/home2/bin"
+out="$(HOME="$T/home2" PATH="$T/home2/projects/app/bin:$T/home2/bin" vpnsh_safe_path "$T/home2/projects")"
+out2="$(HOME="$T/home2" PATH="$T/home2/projects/app/bin:$T/home2/bin" vpnsh_safe_path "$T/HOME2/PROJECTS")"
+out3="$(HOME="$T/HOME2" PATH="$T/home2/projects/app/bin:$T/home2/bin" vpnsh_safe_path "$T/home2/Projects")"
+case ":$out:$out2:$out3:" in
+	*"projects/app/bin"*) ng "綴りの大文字・小文字が違うと、マウントできる場所の配下が PATH に残る: $out / $out2 / $out3" ;;
+	*) ok "綴りの大文字・小文字が違っても、マウントできる場所の配下を PATH から除く" ;;
+esac
 
 echo "== 1b. マウントを許可する場所 (mount-root) の検査"
 # shellcheck source=lib/mount.sh
@@ -69,6 +100,17 @@ for d in "$T/home" "$T/home/.ssh" "$T/home/.config/dev" "$T/home/Library/x" "$T/
 	HOME="$T/home" mnt_root_ok "$d" >/dev/null 2>&1 && { bad=$((bad + 1)); echo "    受け付けた: $d"; }
 done
 [ "$bad" -eq 0 ] && ok "ホームそのもの・. で始まるディレクトリの中・~/Library・空白を含むパス・ホームの外・相対パス・無いディレクトリは使えない" || ng "使えないはずの場所を $bad 個受け付けた"
+# 大文字・小文字を区別しないファイルシステム (APFS の既定) では、綴りを変えても ~/Library の中を指せる。
+# 区別するファイルシステムでも判定を通すよう、小文字の library を実際に作った別のホームでも試す
+mkdir -p "$T/home3/library/x"
+bad=0
+for d in "$T/home/library" "$T/home/library/x" "$T/home/LIBRARY/x" "$T/home/LiBrArY/x"; do
+	HOME="$T/home" mnt_root_ok "$d" >/dev/null 2>&1 && { bad=$((bad + 1)); echo "    受け付けた: $d"; }
+done
+for d in "$T/home3/library" "$T/home3/library/x"; do
+	HOME="$T/home3" mnt_root_ok "$d" >/dev/null 2>&1 && { bad=$((bad + 1)); echo "    受け付けた: $d"; }
+done
+[ "$bad" -eq 0 ] && ok "綴りの大文字・小文字を変えても (~/library・~/LIBRARY など) ~/Library の中は使えない" || ng "綴りを変えた ~/Library を $bad 個受け付けた"
 
 echo "== 2. 注入を防ぐ"
 out="$(export COMPOSE_FILE=x.yaml COMPOSE_PROJECT_NAME=evil DOCKER_HOST=tcp://1.2.3.4 BUILDKIT_HOST=x WIREGUARD_ENDPOINT_IP=6.6.6.6 EXPECTED_PUBLIC_IP=6.6.6.6 VPNSH_WG_PRIVATE_KEY=secret

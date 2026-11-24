@@ -6,7 +6,15 @@
 set -u
 umask 077
 
-VPNSH_VERSION="1.0.0"
+# 利用者の PATH には、コンテナから書き換えられる場所 (mount-root の配下。direnv の PATH_add、node_modules/.bin など)
+# が入り得る。安全にする (vpnsh_safe_path) までは使わず、決まった場所のコマンドだけを使う。
+# 元の PATH は、vpnsh_safe_path に渡すときと、doctor が「vpnsh が PATH から使えるか」を調べるときだけ使う
+VPNSH_ORIG_PATH="$PATH"
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+# CDPATH があると、相対パスの cd が別のディレクトリに移り (移った先も表示する)、リポジトリの場所を取り違えるため
+unset CDPATH
+
+VPNSH_VERSION="1.0.1"
 
 # 対象のプロジェクトやコンテナ名を環境変数で上書きさせない (テストは lib を直接使う)
 unset VPNSH_PROJECT VPNSH_CONTEXT VPNSH_GLUETUN_NAME VPNSH_STATE_DIR VPNSH_ENV_FILE VPNSH_TEST_SSH_CONFIG
@@ -46,10 +54,8 @@ vpnsh_clean_env
 # マウントを許可するディレクトリ (vpnsh config set mount-root で変えられる。既定 ~/Projects)
 VPNSH_MOUNT_ROOT="$(vpnsh_env_get VPNSH_MOUNT_ROOT)"
 [ -n "$VPNSH_MOUNT_ROOT" ] || VPNSH_MOUNT_ROOT="$HOME/Projects"
-# PATH からマウントできる場所 (mount-root の配下) などを除く (lib/common.sh の vpnsh_safe_path)。
-# 元の PATH は、doctor が「vpnsh が PATH から使えるか」を調べるためだけに残す
-VPNSH_ORIG_PATH="$PATH"
-PATH="$(vpnsh_safe_path "$VPNSH_MOUNT_ROOT")"
+# 元の PATH からマウントできる場所 (mount-root の配下) などを除く (lib/common.sh の vpnsh_safe_path)
+PATH="$(PATH="$VPNSH_ORIG_PATH" vpnsh_safe_path "$VPNSH_MOUNT_ROOT")"
 export PATH
 
 VPNSH_VERBOSE=""
@@ -420,7 +426,7 @@ EOF
 	trap - HUP TERM INT
 	# 中継が先に終わっていた (= コンテナ側が中継の切断でシェルを閉じた) なら、理由を表示する
 	if [ -n "$with_ssh" ] && [ -n "$SSH_RELAY_PID" ] && ! kill -0 "$SSH_RELAY_PID" 2>/dev/null && [ "$rc" -ge 128 ]; then
-		vpnsh_warn "SSH の中継が切れたため、シェルを終了しました (もう一度 vpnsh --ssh を実行してください)"
+		vpnsh_warn "SSH の中継が切れたため、シェルを終了しました (SSH 鍵の使用を短い間に何度も拒否・時間切れにした場合も、安全のため中継を止めます。記録は state/ssh-audit.log。もう一度 vpnsh --ssh を実行してください)"
 	fi
 	kill_own_work
 	ssh_relay_stop

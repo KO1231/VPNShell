@@ -40,7 +40,9 @@ mnt_root_ok() {
 	case "$real" in "$home"/*) ;; *) vpnsh_err "mount-root はホームの中のディレクトリにしてください (ホームそのものは不可): $real"; return 1 ;; esac
 	rel="${real#"$home"/}"
 	case "/$rel/" in */.*) vpnsh_err "mount-root に . で始まるディレクトリ (~/.ssh など) は使えません: $real"; return 1 ;; esac
-	case "$rel/" in Library/*) vpnsh_err "mount-root に ~/Library の中は使えません: $real"; return 1 ;; esac
+	# APFS は既定で大文字・小文字を区別せず、cd -P / pwd も入力の綴りのまま返すので、小文字にそろえて比べる
+	# (~/library や ~/LIBRARY でも ~/Library の中を指せてしまうため)
+	case "$(vpnsh_lc "$rel")/" in library/*) vpnsh_err "mount-root に ~/Library の中は使えません: $real"; return 1 ;; esac
 	printf '%s' "$real" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/-]+$' ||
 		{ vpnsh_err "mount-root のパスに使えない文字があります (英数字と . _ - / だけ): $real"; return 1; }
 	printf '%s' "$real"
