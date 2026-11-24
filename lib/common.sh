@@ -29,7 +29,7 @@ vpnsh_visible() { perl -pe 's/([\x00-\x08\x0b-\x1f\x7f])/"^" . chr(ord($1) ^ 64)
 
 # vpnsh_lc <文字列>  英字を小文字にして出す (bash 3.2 には ${v,,} が無いため)
 # tr は絶対パスで呼ぶ (vpnsh_safe_path は PATH を安全にする前に呼ばれるので、PATH から探すと偽物を使い得る)
-vpnsh_lc() { printf '%s' "$1" | LC_ALL=C /usr/bin/tr 'A-Z' 'a-z'; }
+vpnsh_lc() { printf '%s' "$1" | LC_ALL=C /usr/bin/tr '[:upper:]' '[:lower:]'; }
 
 # ---- PATH を安全にする ----
 # vpnsh_safe_path <マウントできる場所の根元>  PATH から、マウントできる場所の配下・相対パス・存在しないものを除き、

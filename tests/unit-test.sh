@@ -109,7 +109,7 @@ done
 for d in "$T/home3/library" "$T/home3/library/x"; do
 	HOME="$T/home3" mnt_root_ok "$d" >/dev/null 2>&1 && { bad=$((bad + 1)); echo "    受け付けた: $d"; }
 done
-[ "$bad" -eq 0 ] && ok "~/library・~/LIBRARY など、綴りの大文字・小文字を変えても ~/Library の中は使えない" || ng "綴りを変えた ~/Library を $bad 個受け付けた"
+[ "$bad" -eq 0 ] && ok "綴りの大文字・小文字を変えても (~/library・~/LIBRARY など) ~/Library の中は使えない" || ng "綴りを変えた ~/Library を $bad 個受け付けた"
 
 echo "== 2. 注入を防ぐ"
 out="$(export COMPOSE_FILE=x.yaml COMPOSE_PROJECT_NAME=evil DOCKER_HOST=tcp://1.2.3.4 BUILDKIT_HOST=x WIREGUARD_ENDPOINT_IP=6.6.6.6 EXPECTED_PUBLIC_IP=6.6.6.6 VPNSH_WG_PRIVATE_KEY=secret
