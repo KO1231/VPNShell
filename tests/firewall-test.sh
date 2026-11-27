@@ -36,6 +36,8 @@ PASS=0
 FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  \033[32mOK\033[0m   %s\n' "$*"; }
 ng() { FAIL=$((FAIL + 1)); printf '  \033[31mNG\033[0m   %s\n' "$*"; }
+# skip <説明>  省略したことを表示する (VPNSH_CI=1 なら NG にする)
+skip() { if [ "${VPNSH_CI:-}" = 1 ]; then ng "省略した (CI では省略しない): $*"; else printf '  (%s)\n' "$*"; fi; }
 
 cleanup() {
 	vpnsh_docker rm -f "$VPNSH_PROJECT-ipsrv" >/dev/null 2>&1
@@ -118,7 +120,7 @@ echo "== 2. 遮断ルール・ルーティングの改ざんを検出する"
 # tamper <説明> <加えるコマンド> <戻すコマンド>  (gluetun の中で実行する)
 tamper() {
 	if ! vpnsh_docker exec "$NAME" sh -c "$2" >/dev/null 2>&1; then
-		echo "  (この環境では「$1」を試せません)"
+		skip "この環境では「$1」を試せません"
 		return
 	fi
 	gl_fw_check >/dev/null 2>&1 && ng "検出しない: $1" || ok "検出する: $1"
@@ -148,7 +150,7 @@ probe() {
 		--network "container:$NAME" --entrypoint sh vpnshell-work:local -c "$1" 2>&1
 }
 if ! vpnsh_docker image inspect vpnshell-work:local >/dev/null 2>&1; then
-	echo "  (work イメージが無いので 3〜4 は省略。bin/vpnsh build の後に再実行してください)"
+	skip "work イメージが無いので 3〜4 は省略。bin/vpnsh build の後に再実行してください"
 else
 	out="$(probe 'start=$(date +%s%N); dig +time=2 +tries=1 @127.0.0.11 example.com >/dev/null 2>&1; rc=$?; end=$(date +%s%N); echo "$rc $(( (end-start)/1000000 ))"')"
 	rc="${out%% *}"; ms="${out##* }"

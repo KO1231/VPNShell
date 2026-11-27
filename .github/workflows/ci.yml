@@ -14,6 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  VPNSH_CI: "1"
   SHELLCHECK_IMAGE: koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
 
 jobs:
@@ -71,7 +72,9 @@ jobs:
       - name: Mount safety tests
         run: /bin/bash tests/mount-test.sh
 
-      - name: SSH tests
+      - name: SSH tests (without Docker)
+        env:
+          VPNSH_TEST_SKIP_DOCKER: "1"
         run: /bin/bash tests/ssh-test.sh
 
   image:

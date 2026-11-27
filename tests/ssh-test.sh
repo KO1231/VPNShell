@@ -11,6 +11,8 @@ PASS=0
 FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  \033[32mOK\033[0m   %s\n' "$*"; }
 ng() { FAIL=$((FAIL + 1)); printf '  \033[31mNG\033[0m   %s\n' "$*"; }
+# skip <説明>  省略したことを表示する (VPNSH_CI=1 なら NG にする)
+skip() { if [ "${VPNSH_CI:-}" = 1 ]; then ng "省略した (CI では省略しない): $*"; else printf '  (%s)\n' "$*"; fi; }
 
 # ---------------------------------------------------------------------------
 echo "== 1. 確認ダイアログの判定"
@@ -162,8 +164,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [ "${VPNSH_TEST_SKIP_DOCKER:-}" = 1 ]; then
+	echo "  (VPNSH_TEST_SKIP_DOCKER=1 なので省略)"
+	echo; echo "結果: OK=$PASS NG=$FAIL"; [ "$FAIL" -eq 0 ]; exit
+fi
 if ! vpnsh_docker image inspect vpnshell-work:local >/dev/null 2>&1; then
-	echo "  (work イメージが無いので省略。bin/vpnsh build の後に再実行してください)"
+	skip "work イメージが無いので省略。bin/vpnsh build の後に再実行してください"
 	echo; echo "結果: OK=$PASS NG=$FAIL"; [ "$FAIL" -eq 0 ]; exit
 fi
 if ! vpnsh_docker image inspect "$SSHD_IMAGE" >/dev/null 2>&1; then
