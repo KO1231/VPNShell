@@ -76,6 +76,38 @@ d="$(HOME="$T" mnt_display "$T/allowed/proj")"
 d="$(mnt_display "/x/\$(id)/y")"
 case "$d" in *'$('*) ng "記号が残っている: $d" ;; *) ok "表示に使えない文字を置き換える ($d)" ;; esac
 
+echo "== マウントの準備 (-m / --mount-cwd-rw)"
+H="$T/pm/home"
+mkdir -p "$H/Projects/app" "$H/Library/x" "$T/pm/elsewhere"
+# pm <ro|rw|""> <mount-root> <カレントディレクトリ>  prepare_mount を呼び、compose run に渡す引数と終了コードを出す
+pm() {
+	(
+		HOME="$H"; VPNSH_MOUNT="$1"; VPNSH_MOUNT_ROOT="$2"; VPNSH_ROOT="$ROOT"
+		cd "$3" || exit 9
+		prepare_mount 2>"$T/pm.err" && mnt_run_args | tr '\n' ' '
+	)
+	echo "rc=$?"
+}
+# shellcheck disable=SC2088  # ~/ の書き方の mount-root と、表示用の ~ を試す
+want="-v $H/Projects/app:/work:ro -w /work -e VPNSH_MOUNT=ro -e VPNSH_MOUNT_DISPLAY=~/Projects/app --label vpnsh.mount=ro rc=0"
+# shellcheck disable=SC2088
+out="$(pm ro "~/Projects" "$H/Projects/app")"
+[ "$out" = "$want" ] && ok "-m では実体のパスを /work に読み取り専用 (:ro) でマウントする引数を作る" || ng "-m の引数が想定外: $out"
+out="$(pm rw "$H/Projects" "$H/Projects/app")"
+case "$out" in "-v $H/Projects/app:/work:rw "*"--label vpnsh.mount=rw rc=0") grep -q '警告' "$T/pm.err" && ok "--mount-cwd-rw では読み書き可能 (:rw) でマウントし、警告を出す" || ng "--mount-cwd-rw で警告が出ない" ;; *) ng "--mount-cwd-rw の引数が想定外: $out" ;; esac
+out="$(pm "" "$H/Projects" "$H/Projects/app")"
+[ "$out" = "rc=0" ] && ok "マウントしないときは引数を作らない" || ng "マウントしないときの結果が想定外: $out"
+bad=0
+for root in "$H/Library/x" "$T/pm/elsewhere" "$H" "Projects"; do
+	out="$(pm ro "$root" "$H/Projects/app")"
+	{ [ "$out" = "rc=125" ] && grep -q 'mount-root が正しくありません' "$T/pm.err"; } || { bad=$((bad + 1)); echo "    mount-root $root を拒否しない: $out"; }
+done
+[ "$bad" -eq 0 ] && ok ".env の mount-root も使う前に検査し直す (~/Library の中・ホームの外・ホームそのもの・相対パスなら 125 で止まる)" || ng "検査し直さない mount-root が $bad 個"
+out="$(pm ro "$H/Projects" "$T/pm/elsewhere")"
+[ "$out" = "rc=125" ] && ok "カレントディレクトリが mount-root の配下でなければ 125 で止まる" || ng "mount-root の外のディレクトリの結果が想定外: $out"
+rm -f "$T/pm.err"
+rmdir "$H/Projects/app" "$H/Projects" "$H/Library/x" "$H/Library" "$H" "$T/pm/elsewhere" "$T/pm" 2>/dev/null
+
 echo
 echo "結果: OK=$PASS NG=$FAIL"
 [ "$FAIL" -eq 0 ]
