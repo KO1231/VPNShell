@@ -123,7 +123,7 @@ EOF
 gl_expected_env() {
 	local ref img comp
 	ref="$(gl_pinned_image)"
-	img="$(vpnsh_docker image inspect -f '{{json .Config.Env}}' "$ref" 2>/dev/null)" || { vpnsh_err "固定した gluetun のイメージ ($ref) がありません"; return 1; }
+	img="$(vpnsh_docker image inspect -f '{{json .Config.Env}}' "$ref" 2>/dev/null)" || { vpnsh_err "固定した gluetun のイメージ ($ref) がありません。\`vpnsh build\` を実行してください"; return 1; }
 	comp="$(vpnsh_compose_t 30 config --format json 2>/dev/null)" || { vpnsh_err "compose.yaml を読めません"; return 1; }
 	IMG="$img" COMP="$comp" perl -MJSON::PP -e '
 		my %env; my @order;
