@@ -91,11 +91,20 @@ jobs:
         with:
           persist-credentials: false
 
+      # vpnsh build と同じく、実行するユーザーの UID・GID でビルドする
       - name: Build the work image
-        run: docker compose -f compose.yaml --env-file .env.example --profile work build work
+        run: VPNSH_UID="$(id -u)" VPNSH_GID="$(id -g)" docker compose -f compose.yaml --env-file .env.example --profile work build work
 
       - name: Check the image is hardened
         run: tests/image-test.sh
+
+      - name: Pull the pinned gluetun image
+        run: docker compose -f compose.yaml --env-file .env.example pull gluetun
+
+      - name: SSH tests (with Docker)
+        env:
+          VPNSH_CONTEXT: default
+        run: /bin/bash tests/ssh-test.sh
 
   # 必須のチェック (image) として、両方のアーキテクチャの結果をまとめる
   image:

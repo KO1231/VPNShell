@@ -120,7 +120,7 @@ CFG
 	[ "$(printf '%s\n' "$out" | grep -c .)" = "2" ] && printf '%s\n' "$out" | grep -q "^alpha alpha2.example.com 22 deploy $HOME/.ssh/id_alpha$" &&
 		ok "同じ名前は置き換え、~ で書いた鍵は読むときに展開する" || ng "state/hosts の内容が想定外: $out"
 	grep -q '~/.ssh/id_alpha' "$VPNSH_STATE_DIR/hosts" && ok "state/hosts には ~ のまま書く (Mac ごとの HOME の違いに強い)" || ng "state/hosts に絶対パスが書かれた"
-	[ "$(stat -f %Lp "$VPNSH_STATE_DIR/hosts")" = "600" ] && ok "state/hosts の権限は 600" || ng "state/hosts の権限が想定外"
+	[ "$(perl -e 'printf "%o", (stat shift)[2] & 07777' "$VPNSH_STATE_DIR/hosts")" = "600" ] && ok "state/hosts の権限は 600" || ng "state/hosts の権限が想定外"
 	ssh_hosts_del beta
 	[ "$(ssh_hosts | grep -c .)" = "1" ] && ok "名前を指定して取り除ける" || ng "取り除けない"
 	echo "$PASS $FAIL" >"$T/counts"
@@ -191,7 +191,7 @@ VPNSH_GLUETUN_NAME=$VPNSH_GLUETUN_NAME
 VPNSH_STATE_DIR=$T/state
 EOF
 # shellcheck disable=SC2119  # 引数なし (初回作成) で呼ぶ
-gl_create >/dev/null 2>&1 || { echo "gluetun を作成できません" >&2; exit 1; }
+gl_create >/dev/null 2>"$T/create.err" || { cat "$T/create.err" >&2; echo "gluetun を作成できません" >&2; exit 1; }
 
 # テスト用の鍵 (使い捨て) と sshd 2台 (同じネットワーク名前空間の 127.0.0.1:2222 と :2223、ホスト鍵は別)
 ssh-keygen -q -t ed25519 -N '' -C vpnsh-test-key -f "$T/id_test"
