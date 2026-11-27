@@ -128,6 +128,118 @@ CFG
 read -r PASS FAIL <"$T/counts" || FAIL=$((FAIL + 1))
 
 # ---------------------------------------------------------------------------
+echo "== 1c. 専用 ssh-agent の起動と停止"
+(
+	VPNSH_ROOT="$T/agentroot"; VPNSH_STATE_DIR="$T/state1c"; mkdir -p "$VPNSH_ROOT/scripts" "$VPNSH_STATE_DIR"
+	# shellcheck source=lib/common.sh
+	. "$ROOT/lib/common.sh"
+	# shellcheck source=lib/ssh.sh
+	. "$ROOT/lib/ssh.sh"
+	# 偽の確認ダイアログ: 呼ばれたときの環境変数を記録して許可する
+	cat >"$VPNSH_ROOT/scripts/ssh-askpass" <<EOF
+#!/bin/bash
+env >"$T/askpass-env-1c"
+exit 0
+EOF
+	chmod +x "$VPNSH_ROOT/scripts/ssh-askpass"
+	mkdir -p "$SSH_AGENT_DIR" && echo "古い記録" >"$SSH_AGENT_DIR/added"
+	export VPNSH_TEST_LEAK=leak-value
+	ssh_agent_start
+	pid="$(cat "$SSH_AGENT_DIR/pid" 2>/dev/null)"
+	agent_args="$(ps -o args= -p "${pid:-0}" 2>/dev/null)"
+	[ -S "$SSH_AGENT_SOCK" ] && case "$agent_args" in *ssh-agent*"-a $SSH_AGENT_SOCK"*"-P none"*) true ;; *) false ;; esac &&
+		ok "専用のソケットで、PKCS#11 などの読み込みを禁止 (-P none) して起動し、PID を記録する" || ng "起動のしかたが想定外: ${agent_args:-起動していない}"
+	[ ! -s "$SSH_AGENT_DIR/added" ] && ok "起動すると、読み込んだ鍵の記録を空にする" || ng "鍵の記録が残った"
+	ssh_agent_start
+	[ "$(cat "$SSH_AGENT_DIR/pid" 2>/dev/null)" = "$pid" ] && ok "動いていれば起動し直さない" || ng "動いているのに起動し直した"
+	ssh-keygen -q -t ed25519 -N '' -C vpnsh-1c -f "$T/id_1c"
+	SSH_AUTH_SOCK="$SSH_AGENT_SOCK" /usr/bin/ssh-add -q -c "$T/id_1c" 2>/dev/null
+	echo msg >"$T/msg-1c"
+	SSH_AUTH_SOCK="$SSH_AGENT_SOCK" ssh-keygen -Y sign -n vpnsh-test -f "$T/id_1c.pub" "$T/msg-1c" >/dev/null 2>&1
+	if [ ! -f "$T/askpass-env-1c" ]; then
+		ng "確認付きの鍵を使っても確認ダイアログが呼ばれない"
+	elif grep -q VPNSH_TEST_LEAK "$T/askpass-env-1c"; then
+		ng "vpnsh の環境変数が確認ダイアログ (ssh-agent) に渡った"
+	else
+		grep -qxF "VPNSH_STATE_DIR=$VPNSH_STATE_DIR" "$T/askpass-env-1c" && grep -qx 'PATH=/usr/bin:/bin:/usr/sbin:/sbin' "$T/askpass-env-1c" &&
+			ok "確認ダイアログには決まった環境変数だけを渡す (vpnsh の環境を持ち込まない)" || ng "確認ダイアログの環境変数が想定外: $(cut -d= -f1 "$T/askpass-env-1c" | tr '\n' ' ')"
+	fi
+	ssh_agent_stop
+	i=0; while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.1; i=$((i + 1)); done
+	! kill -0 "$pid" 2>/dev/null && [ ! -e "$SSH_AGENT_SOCK" ] && [ ! -e "$SSH_AGENT_DIR/pid" ] && [ ! -e "$SSH_AGENT_DIR/added" ] &&
+		ok "止めると、プロセスを終わらせてソケットと記録を消す" || ng "止めたあとにプロセスか記録が残った"
+	sleep 30 & other=$!
+	echo "$other" >"$SSH_AGENT_DIR/pid"
+	ssh_agent_stop
+	kill -0 "$other" 2>/dev/null && ok "記録の PID が vpnsh の ssh-agent でなければ、そのプロセスは終わらせない" || ng "vpnsh の ssh-agent ではないプロセスを終わらせた"
+	kill "$other" 2>/dev/null
+	echo "$PASS $FAIL" >"$T/counts"
+)
+read -r PASS FAIL <"$T/counts" || FAIL=$((FAIL + 1))
+
+# ---------------------------------------------------------------------------
+echo "== 1d. trust-host のホスト鍵の比較と保存"
+(
+	VPNSH_ROOT="$ROOT"; VPNSH_STATE_DIR="$T/state1d"; mkdir -p "$VPNSH_STATE_DIR"
+	# shellcheck source=lib/common.sh
+	. "$ROOT/lib/common.sh"
+	# shellcheck source=lib/ssh.sh
+	. "$ROOT/lib/ssh.sh"
+	for n in 1 2 3; do ssh-keygen -q -t ed25519 -N '' -f "$T/hk$n"; done
+	ssh-keygen -q -t ecdsa -N '' -f "$T/hk4"
+	# khline <known_hosts の名前> <鍵>  ssh-keyscan が出す形の行
+	khline() { printf '%s %s\n' "$1" "$(cut -d' ' -f1-2 "$2.pub")"; }
+	KH="[h.example.com]:2222"
+	A="$(khline "$KH" "$T/hk1")"; B="$(khline "$KH" "$T/hk4")"; C="$(khline "$KH" "$T/hk2")"
+	O="$(khline other.example.com "$T/hk3")"
+	[ "$(ssh_kh_compare h.example.com 2222 "$A")" = "new" ] && ok "保存済みのホスト鍵が無ければ new" || ng "保存前の比較が想定外"
+	ssh_kh_replace other.example.com 22 "$O"
+	ssh_kh_replace h.example.com 2222 "$A
+$B"
+	[ "$(ssh_kh_compare h.example.com 2222 "$B
+$A")" = "same" ] && ok "順序が違っても同じ鍵の組なら same (保存し直さない)" || ng "同じ鍵の組の比較が想定外"
+	[ "$(ssh_kh_compare h.example.com 2222 "$A")" = "partial" ] && [ "$(ssh_kh_compare h.example.com 2222 "$A
+$B
+$C")" = "partial" ] && ok "一部だけが一致 (種類が減った・増えた) なら partial" || ng "一部が一致するときの比較が想定外"
+	[ "$(ssh_kh_compare h.example.com 2222 "$C")" = "different" ] && ok "1つも一致しなければ different (MITM の警告を出す側)" || ng "一致しないときの比較が想定外"
+	[ "$(ssh_kh_compare h.example.com 22 "$(khline h.example.com "$T/hk1")")" = "new" ] && ok "ポートが違えば別の接続先として扱う" || ng "ポートの違う接続先を同じものとして扱った"
+	ssh_kh_replace h.example.com 2222 "$C"
+	[ "$(grep -c '^\[h\.example\.com\]:2222 ' "$SSH_KNOWN_HOSTS")" = "1" ] && grep -qxF "$C" "$SSH_KNOWN_HOSTS" && grep -qxF "$O" "$SSH_KNOWN_HOSTS" &&
+		ok "保存し直すと、その接続先の古い鍵を消して新しい鍵だけにし、ほかの接続先は残す" || ng "保存し直した結果が想定外: $(cat "$SSH_KNOWN_HOSTS")"
+	[ "$(perl -e 'printf "%o", (stat shift)[2] & 07777' "$SSH_KNOWN_HOSTS")" = "600" ] && [ ! -e "$SSH_KNOWN_HOSTS.old" ] &&
+		ok "known_hosts の権限は 600 で、ssh-keygen -R の控え (.old) を残さない" || ng "known_hosts の権限か控えが想定外"
+	echo "$PASS $FAIL" >"$T/counts"
+)
+read -r PASS FAIL <"$T/counts" || FAIL=$((FAIL + 1))
+
+# ---------------------------------------------------------------------------
+echo "== 1e. シェル専用の SSH の設定の片付け"
+(
+	VPNSH_ROOT="$ROOT"; VPNSH_STATE_DIR="$T/state1e"; mkdir -p "$VPNSH_STATE_DIR"
+	# shellcheck source=lib/common.sh
+	. "$ROOT/lib/common.sh"
+	# shellcheck source=lib/ssh.sh
+	. "$ROOT/lib/ssh.sh"
+	# mksess <ディレクトリ>  シェル専用の設定と同じ形のディレクトリを作る
+	mksess() { mkdir -p "$1/keys" && : >"$1/config" && : >"$1/known_hosts" && : >"$1/keys/srv.pub"; }
+	sleep 0 & dead=$!; wait "$dead"
+	mksess "$SSH_GEN_DIR/s.$dead"; mksess "$SSH_GEN_DIR/s.$$"
+	ssh_session_gc
+	[ ! -e "$SSH_GEN_DIR/s.$dead" ] && [ -f "$SSH_GEN_DIR/s.$$/config" ] && ok "持ち主の vpnsh が終わったシェルの設定だけを消す" || ng "片付けの結果が想定外: $(ls "$SSH_GEN_DIR")"
+	mksess "$T/outside1e/s.$dead"
+	ssh_session_remove "$T/outside1e/s.$dead"
+	[ -f "$T/outside1e/s.$dead/config" ] && ok "vpnsh のディレクトリの外は消さない" || ng "vpnsh のディレクトリの外を消した"
+	mksess "$SSH_GEN_DIR/s.$dead"; echo keep >"$SSH_GEN_DIR/s.$dead/keys/id_secret"
+	ssh_session_remove "$SSH_GEN_DIR/s.$dead"
+	[ -f "$SSH_GEN_DIR/s.$dead/keys/id_secret" ] && [ ! -e "$SSH_GEN_DIR/s.$dead/config" ] && [ ! -e "$SSH_GEN_DIR/s.$dead/keys/srv.pub" ] &&
+		ok "消すのは vpnsh が作るファイル (config・known_hosts・*.pub) だけ (ほかのファイルは残す)" || ng "知らないファイルの扱いが想定外"
+	ssh_session_remove "$SSH_GEN_DIR/s.$$"
+	[ ! -e "$SSH_GEN_DIR/s.$$" ] && ok "自分のシェルの設定は終了時に消せる" || ng "自分のシェルの設定が残った"
+	echo "$PASS $FAIL" >"$T/counts"
+)
+read -r PASS FAIL <"$T/counts" || FAIL=$((FAIL + 1))
+
+# ---------------------------------------------------------------------------
 echo "== 2. 通しの動作 (偽の gluetun + テスト用 sshd)"
 VPNSH_ROOT="$ROOT"
 VPNSH_PROJECT="vpnshell-sshtest"
