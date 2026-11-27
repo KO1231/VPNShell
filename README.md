@@ -20,7 +20,7 @@ $ vpnsh
 - **The private key is stored in the macOS Keychain** — the WireGuard private key is never written to a file, and macOS asks for confirmation each time it is used
 - **Use SSH without handing over your keys (`--ssh`)** — SSH keys are placed in a dedicated `ssh-agent`, a confirmation dialog appears every time the shell uses one, and they can be used only with the servers you registered. Your machine's `ssh-agent` and `~/.ssh` are never touched
 - **Work on your local projects** — mount the current directory read-only (`-m`) or read-write (`--mount-cwd-rw`)
-- **Hardened, disposable shells** — each shell is disposable and has no permission to modify system directories; capabilities, setuid programs and `ptrace` are all forbidden, so the design is robust against a shell takeover
+- **Hardened, disposable shells** — each shell is disposable and has no permission to modify system directories; capabilities, setuid programs, `ptrace` and rarely used kernel interfaces are all forbidden, so the design is robust against a shell takeover
 
 ## Requirements
 
