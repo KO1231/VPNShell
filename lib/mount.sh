@@ -85,3 +85,28 @@ mnt_display() {
 	case "$p" in "$home"/*) p="~${p#"$home"}" ;; esac
 	printf '%s' "$p" | LC_ALL=C tr -c 'A-Za-z0-9._~/+@ -' '?' | cut -c1-120
 }
+
+# prepare_mount  -m / --mount-cwd-rw のとき、カレントディレクトリを検査して SESSION_MOUNT_* を決める
+SESSION_MOUNT_SRC=""
+SESSION_MOUNT_DISPLAY=""
+prepare_mount() {
+	[ -n "$VPNSH_MOUNT" ] || return 0
+	# .env に書かれた mount-root も、使う前に検査し直す (手で書き換えられていても安全なように)
+	local root
+	root="$(mnt_root_ok "$VPNSH_MOUNT_ROOT" 2>&1)" || vpnsh_die "mount-root が正しくありません ($root)。vpnsh config set mount-root <ディレクトリ> で設定し直してください" "$VPNSH_EXIT_PREFLIGHT"
+	SESSION_MOUNT_SRC="$(mnt_check "$PWD" "$root" "$VPNSH_ROOT")" || exit "$VPNSH_EXIT_PREFLIGHT"
+	SESSION_MOUNT_DISPLAY="$(mnt_display "$SESSION_MOUNT_SRC")"
+	if [ "$VPNSH_MOUNT" = "rw" ]; then
+		vpnsh_warn "$SESSION_MOUNT_DISPLAY を読み書き可能でマウントします。コンテナ内のコードは .git/config や .git/hooks、.envrc、.vscode/tasks.json などを書き換えて、Mac 上で (素のIPで) 実行させることができます。信頼できないものを動かすときは -m (読み取り専用) を使ってください"
+	else
+		vpnsh_info "$SESSION_MOUNT_DISPLAY を /work に読み取り専用でマウントします"
+	fi
+}
+
+# mnt_run_args  マウントするときに compose run に渡す引数を1行に1つずつ出す
+mnt_run_args() {
+	[ -n "$SESSION_MOUNT_SRC" ] || return 0
+	printf '%s\n' -v "$SESSION_MOUNT_SRC:/work:$VPNSH_MOUNT" -w /work \
+		-e "VPNSH_MOUNT=$VPNSH_MOUNT" -e "VPNSH_MOUNT_DISPLAY=$SESSION_MOUNT_DISPLAY" \
+		--label "vpnsh.mount=$VPNSH_MOUNT"
+}

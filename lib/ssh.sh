@@ -352,6 +352,38 @@ ssh_session_gc() {
 	return 0
 }
 
+# ssh_kh_saved <known_hosts の名前>  保存済みのホスト鍵 (種類と鍵) を1行ずつ出す
+ssh_kh_saved() {
+	[ -f "$SSH_KNOWN_HOSTS" ] || return 0
+	grep -v '^#' "$SSH_KNOWN_HOSTS" | awk -v h="$1" '$1 == h { $1 = ""; sub(/^ /, ""); print }'
+}
+
+# ssh_kh_compare <ホスト> <ポート> <取得した行>  保存済みのホスト鍵と比べて new / same / partial / different を出す
+ssh_kh_compare() {
+	local saved
+	ssh_has_known_host "$1" "$2" || { echo new; return 0; }
+	saved="$(ssh_kh_saved "$(ssh_kh_name "$1" "$2")")"
+	if printf '%s\n' "$3" | cut -d' ' -f2- | sort | cmp -s - <(printf '%s\n' "$saved" | sort); then
+		echo same
+	elif printf '%s\n' "$3" | cut -d' ' -f2- | grep -qxF -f <(printf '%s\n' "$saved"); then
+		echo partial
+	else
+		echo different
+	fi
+}
+
+# ssh_kh_replace <ホスト> <ポート> <取得した行>  その接続先の保存済みのホスト鍵を、取得した行で置き換える
+ssh_kh_replace() {
+	local kh
+	kh="$(ssh_kh_name "$1" "$2")"
+	if [ -f "$SSH_KNOWN_HOSTS" ]; then
+		ssh-keygen -R "$kh" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1
+		rm -f "$SSH_KNOWN_HOSTS.old"
+	fi
+	printf '%s\n' "$3" >>"$SSH_KNOWN_HOSTS"
+	chmod 0600 "$SSH_KNOWN_HOSTS"
+}
+
 # ssh_valid_keyscan_line <行> <known_hosts での名前>  ssh-keyscan の出力として正しい、接続先の行か
 ssh_valid_keyscan_line() {
 	local first="${1%% *}"

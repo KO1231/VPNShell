@@ -9,7 +9,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 # CDPATH があると、相対パスの cd が別のディレクトリに移り (移った先も表示する)、リポジトリの場所を取り違えるため
 unset CDPATH
 
-VPNSH_VERSION="1.0.3"
+VPNSH_VERSION="1.1.0"
 
 # 対象のプロジェクトやコンテナ名を環境変数で上書きさせない (テストは lib を直接使う)
 unset VPNSH_PROJECT VPNSH_CONTEXT VPNSH_GLUETUN_NAME VPNSH_STATE_DIR VPNSH_ENV_FILE VPNSH_TEST_SSH_CONFIG
@@ -32,6 +32,10 @@ VPNSH_STATE_DIR="$VPNSH_ROOT/state"
 . "$VPNSH_ROOT/lib/fwcheck.sh"
 # shellcheck source=lib/keychain.sh
 . "$VPNSH_ROOT/lib/keychain.sh"
+# shellcheck source=lib/setup.sh
+. "$VPNSH_ROOT/lib/setup.sh"
+# shellcheck source=lib/lock.sh
+. "$VPNSH_ROOT/lib/lock.sh"
 # shellcheck source=lib/gluetun.sh
 . "$VPNSH_ROOT/lib/gluetun.sh"
 # shellcheck source=lib/mount.sh
@@ -55,7 +59,6 @@ export PATH
 
 VPNSH_VERBOSE=""
 VPNSH_YES=""
-GL_HEALTH_WAIT=60
 # カレントディレクトリのマウント ("" / ro / rw)。マウントを許可するのはこのディレクトリの配下だけ
 VPNSH_MOUNT=""
 VPNSH_SSH=""
@@ -153,85 +156,6 @@ confirm() {
 	return 1
 }
 
-ensure_state_dir() {
-	mkdir -p "$VPNSH_STATE_DIR" && chmod 0700 "$VPNSH_STATE_DIR"
-}
-
-require_env() {
-	if [ ! -f "$VPNSH_ENV_FILE" ]; then
-		vpnsh_die "設定 (.env) がありません。まず \`vpnsh setup --import <NordVPN の .conf>\` を実行してください" "$VPNSH_EXIT_PREFLIGHT"
-	fi
-	vpnsh_env_validate || exit "$VPNSH_EXIT_PREFLIGHT"
-	local k
-	for k in WIREGUARD_ENDPOINT_IP WIREGUARD_ENDPOINT_PORT WIREGUARD_PUBLIC_KEY WIREGUARD_ADDRESSES WIREGUARD_MTU; do
-		[ -n "$(vpnsh_env_get "$k")" ] || vpnsh_die ".env に $k がありません。\`vpnsh setup --import <.conf>\` をやり直してください" "$VPNSH_EXIT_PREFLIGHT"
-	done
-	fw_is_ipv4 "$(vpnsh_env_get WIREGUARD_ENDPOINT_IP)" || vpnsh_die ".env の WIREGUARD_ENDPOINT_IP が IPv4 アドレスではありません" "$VPNSH_EXIT_PREFLIGHT"
-	fw_is_port "$(vpnsh_env_get WIREGUARD_ENDPOINT_PORT)" || vpnsh_die ".env の WIREGUARD_ENDPOINT_PORT がポート番号ではありません" "$VPNSH_EXIT_PREFLIGHT"
-	kc_valid_key "$(vpnsh_env_get WIREGUARD_PUBLIC_KEY)" || vpnsh_die ".env の WIREGUARD_PUBLIC_KEY の形式が正しくありません" "$VPNSH_EXIT_PREFLIGHT"
-	printf '%s' "$(vpnsh_env_get WIREGUARD_ADDRESSES)" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/32$' ||
-		vpnsh_die ".env の WIREGUARD_ADDRESSES は IPv4 の /32 アドレス 1つにしてください" "$VPNSH_EXIT_PREFLIGHT"
-	case "$(vpnsh_env_get WIREGUARD_MTU)" in "" | *[!0-9]*) vpnsh_die ".env の WIREGUARD_MTU が数値ではありません" "$VPNSH_EXIT_PREFLIGHT" ;; esac
-}
-
-require_expected_ip() {
-	fw_is_ipv4 "$(vpnsh_env_get EXPECTED_PUBLIC_IP)" ||
-		vpnsh_die ".env に EXPECTED_PUBLIC_IP (IPv4) がありません。\`vpnsh setup --import <.conf>\` を最後まで実行してください" "$VPNSH_EXIT_PREFLIGHT"
-}
-
-# Docker (OrbStack) に接続できないときの案内
-docker_unreachable() {
-	vpnsh_err "Docker (OrbStack) に接続できません: ${GL_DOCKER_ERROR:-}"
-	vpnsh_die "OrbStack が起動しているか確認してください (\`orb start\`)" "$VPNSH_EXIT_PREFLIGHT"
-}
-
-# ---- ロック (変更操作だけにかける) ----
-# ロックのディレクトリに「PID 開始時刻」を書き、持ち主がもう無ければ mv で別名にしてから消して奪う
-LOCK_DIR=""
-LOCK_HELD=""
-lock_acquire() {
-	ensure_state_dir
-	LOCK_DIR="$VPNSH_STATE_DIR/lock"
-	local i=0 owner pid start me
-	me="$$ $(vpnsh_proc_start $$)"
-	while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-		owner="$(cat "$LOCK_DIR/owner" 2>/dev/null)"
-		pid="${owner%% *}"; start="${owner#* }"
-		# 持ち主が書かれていないロックは、作られてから 10 秒たっていれば残骸とみなす
-		local empty_stale=""
-		if [ -z "$owner" ] && [ -d "$LOCK_DIR" ] && [ $(($(date +%s) - $(stat -f %m "$LOCK_DIR" 2>/dev/null || date +%s))) -ge 10 ]; then
-			empty_stale=1
-		fi
-		if [ -n "$empty_stale" ] || { [ -n "$owner" ] && { ! kill -0 "$pid" 2>/dev/null || [ "$(vpnsh_proc_start "$pid")" != "$start" ]; }; }; then
-			local stale="$VPNSH_STATE_DIR/lock.stale.$$"
-			if mv "$LOCK_DIR" "$stale" 2>/dev/null; then
-				if [ "$(cat "$stale/owner" 2>/dev/null)" = "$owner" ]; then
-					vpnsh_warn "前回の vpnsh (PID ${pid:-不明}) が残したロックを解除しました"
-					rm -f "$stale/owner"; rmdir "$stale" 2>/dev/null
-				elif [ ! -e "$LOCK_DIR" ]; then
-					# 別の vpnsh が先に取り直していた → 元に戻す (その間に3つ目が取っていれば、入れ子にしないよう戻さない)
-					mv "$stale" "$LOCK_DIR" 2>/dev/null
-				fi
-			fi
-			continue
-		fi
-		i=$((i + 1))
-		[ "$i" -eq 1 ] && vpnsh_info "別の vpnsh (PID ${pid:-?}) が gluetun を操作中です。終わるのを待っています…"
-		[ "$i" -gt 240 ] && vpnsh_die "ロックを取得できません。ほかの vpnsh が動いていないことを確かめてから、$LOCK_DIR を削除してください"
-		sleep 0.5
-	done
-	if ! echo "$me" >"$LOCK_DIR/owner" 2>/dev/null; then
-		rmdir "$LOCK_DIR" 2>/dev/null
-		vpnsh_die "ロックを作れません (${LOCK_DIR}。ディスクの空きを確かめてください)"
-	fi
-	LOCK_HELD=1
-}
-lock_release() {
-	if [ -n "$LOCK_HELD" ] && [ -n "$LOCK_DIR" ] && [ "$(cat "$LOCK_DIR/owner" 2>/dev/null)" = "$$ $(vpnsh_proc_start $$)" ]; then
-		rm -f "$LOCK_DIR/owner"; rmdir "$LOCK_DIR" 2>/dev/null
-	fi
-	LOCK_HELD=""
-}
 # vpnsh_die などで途中で抜けても、ロックとシェル用の SSH の設定を残さない
 trap 'lock_release; [ -n "${SESSION_SSH_DIR:-}" ] && ssh_session_remove "$SESSION_SSH_DIR"' EXIT
 
@@ -298,60 +222,6 @@ work_image_check() {
 	fi
 }
 
-# ---- gluetun を使える状態にして、ホスト側の検査をする (成功すると SESSION_NETNS が入る) ----
-SESSION_NETNS=""
-prepare_gluetun() {
-	local r
-	gl_inspect; r=$?
-	[ "$r" -eq 2 ] && docker_unreachable
-	vpnsh_timing "gluetun の状態の取得 (docker inspect)"
-	if [ "$r" -eq 1 ]; then
-		lock_acquire
-		gl_inspect; r=$?
-		if [ "$r" -eq 1 ]; then
-			gl_create || { lock_release; exit "$VPNSH_EXIT_PREFLIGHT"; }
-		fi
-		lock_release
-	fi
-	gl_inspect || docker_unreachable
-	case "$GL_STATUS" in
-		exited)
-			# 起動する前に、作成時のとおりか確かめる
-			gl_verify || exit "$VPNSH_EXIT_PREFLIGHT"
-			vpnsh_info "停止している gluetun を起動します"
-			vpnsh_docker start "$VPNSH_GLUETUN_NAME" >/dev/null || vpnsh_die "gluetun を起動できません" "$VPNSH_EXIT_PREFLIGHT"
-			;;
-		created)
-			# 一度も起動していない (作成の途中で止まった) コンテナには secret が入っていない
-			vpnsh_die "gluetun が作成途中の状態です。\`vpnsh up --recreate\` で作り直してください" "$VPNSH_EXIT_PREFLIGHT"
-			;;
-		paused) vpnsh_die "gluetun が一時停止 (paused) しています。\`vpnsh restart\` を実行してください" "$VPNSH_EXIT_PREFLIGHT" ;;
-	esac
-	gl_wait_healthy "$GL_HEALTH_WAIT" || exit "$VPNSH_EXIT_PREFLIGHT"
-	vpnsh_timing "gluetun の healthy の確認"
-	host_checks || exit "$VPNSH_EXIT_PREFLIGHT"
-}
-
-# host_checks  (healthy な gluetun に対して) 整合性・未適用の変更・ファイアウォール
-host_checks() {
-	gl_verify || return 1
-	vpnsh_timing "gluetun の整合性 (ID・イメージ・Env)"
-	local pending
-	if pending="$(gl_pending_changes)"; then
-		vpnsh_err ".env の変更が gluetun に適用されていません ($(echo "$pending" | tr '\n' ' '))。\`vpnsh up\` で適用してください"
-		return 1
-	fi
-	vpnsh_timing "未適用の変更の確認"
-	if ! gl_fw_check; then
-		vpnsh_err "遮断ルールが想定どおりではないため、シェルを起動しません。VPN の再接続中の可能性もあるので、少し待ってから再実行してください。続く場合は \`vpnsh up --recreate\`"
-		return 1
-	fi
-	vpnsh_verbose "ファイアウォールは期待値どおり ($FW_NETNS)"
-	vpnsh_timing "遮断ルール・ルーティングの比較"
-	SESSION_NETNS="$FW_NETNS"
-	return 0
-}
-
 # run_work <mode> [args...]  work コンテナを起動する (mode: shell|run|check|full|mtu|observe)
 run_work() {
 	local mode="$1"; shift
@@ -365,11 +235,11 @@ run_work() {
 	SESSION_START="$start"
 	# マウントと git の作成者情報 (-e と -v の引数を組み立てる。bash 3.2 なので配列は "$@" を使い回さず別に持つ)
 	local extra=() line
-	if [ -n "$SESSION_MOUNT_SRC" ]; then
-		extra+=(-v "$SESSION_MOUNT_SRC:/work:$VPNSH_MOUNT" -w /work
-			-e "VPNSH_MOUNT=$VPNSH_MOUNT" -e "VPNSH_MOUNT_DISPLAY=$SESSION_MOUNT_DISPLAY"
-			--label "vpnsh.mount=$VPNSH_MOUNT")
-	fi
+	while IFS= read -r line; do
+		[ -n "$line" ] && extra+=("$line")
+	done <<EOF
+$(mnt_run_args)
+EOF
 	while IFS= read -r line; do
 		[ -n "$line" ] && extra+=(-e "$line")
 	done <<EOF
@@ -465,23 +335,6 @@ mac_lan_addrs() {
 	} | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | sort -u | tr '\n' ' '
 }
 
-# prepare_mount  -m / --mount-cwd-rw のとき、カレントディレクトリを検査して SESSION_MOUNT_* を決める
-SESSION_MOUNT_SRC=""
-SESSION_MOUNT_DISPLAY=""
-prepare_mount() {
-	[ -n "$VPNSH_MOUNT" ] || return 0
-	# .env に書かれた mount-root も、使う前に検査し直す (手で書き換えられていても安全なように)
-	local root
-	root="$(mnt_root_ok "$VPNSH_MOUNT_ROOT" 2>&1)" || vpnsh_die "mount-root が正しくありません ($root)。vpnsh config set mount-root <ディレクトリ> で設定し直してください" "$VPNSH_EXIT_PREFLIGHT"
-	SESSION_MOUNT_SRC="$(mnt_check "$PWD" "$root" "$VPNSH_ROOT")" || exit "$VPNSH_EXIT_PREFLIGHT"
-	SESSION_MOUNT_DISPLAY="$(mnt_display "$SESSION_MOUNT_SRC")"
-	if [ "$VPNSH_MOUNT" = "rw" ]; then
-		vpnsh_warn "$SESSION_MOUNT_DISPLAY を読み書き可能でマウントします。コンテナ内のコードは .git/config や .git/hooks、.envrc、.vscode/tasks.json などを書き換えて、Mac 上で (素のIPで) 実行させることができます。信頼できないものを動かすときは -m (読み取り専用) を使ってください"
-	else
-		vpnsh_info "$SESSION_MOUNT_DISPLAY を /work に読み取り専用でマウントします"
-	fi
-}
-
 # prepare_ssh  --ssh のとき、このシェル専用の設定を生成し、接続先ごとに鍵がメモリにあるか確かめる
 SESSION_SSH_DIR=""
 prepare_ssh() {
@@ -540,21 +393,6 @@ ssh_relay_start() {
 ssh_relay_stop() {
 	[ -n "$SSH_RELAY_PID" ] && kill "$SSH_RELAY_PID" 2>/dev/null
 	SSH_RELAY_PID=""
-	return 0
-}
-
-# git の作成者情報 (Mac の git config --global から。ファイルはマウントしない)
-git_identity_args() {
-	local name="" email=""
-	# Command Line Tools が無い Mac で /usr/bin/git を呼ぶとインストールのダイアログが出るので避ける
-	if [ "$(command -v git)" = "/usr/bin/git" ] && ! xcode-select -p >/dev/null 2>&1; then
-		return 0
-	fi
-	command -v git >/dev/null 2>&1 || return 0
-	name="$(git config --global user.name 2>/dev/null | LC_ALL=C tr -d '\000-\037\177' | cut -c1-200)"
-	email="$(git config --global user.email 2>/dev/null | LC_ALL=C tr -d '\000-\037\177' | cut -c1-200)"
-	[ -n "$name" ] && printf '%s\n' "GIT_AUTHOR_NAME=$name" "GIT_COMMITTER_NAME=$name"
-	[ -n "$email" ] && printf '%s\n' "GIT_AUTHOR_EMAIL=$email" "GIT_COMMITTER_EMAIL=$email"
 	return 0
 }
 
@@ -1023,7 +861,7 @@ confirm_strict() {
 # cmd_trust_host <名前>  接続先のホスト鍵を VPN 経由で取得し、指紋を確認してから state/known_hosts に保存する
 cmd_trust_host() {
 	[ "$#" -eq 1 ] || vpnsh_die "使い方: vpnsh trust-host <名前>" 2
-	local line name host port user k kh scan valid fps old_fps errf rc changed="" n fp
+	local line name host port user k kh scan valid fps old_fps errf rc changed="" n fp cmp
 	line="$(ssh_host_line "$1")" || vpnsh_die "接続先 $1 はありません (一覧は vpnsh ssh list -a)"
 	read -r name host port user k <<EOF
 $line
@@ -1055,34 +893,33 @@ EOF
 	rm -f "$errf"
 	fps="$(printf '%s\n' "$valid" | ssh-keygen -lf - 2>/dev/null)"
 	echo >&2
-	if ssh_has_known_host "$host" "$port"; then
-		old_fps="$(ssh-keygen -F "$kh" -f "$SSH_KNOWN_HOSTS" 2>/dev/null | grep -v '^#' | ssh-keygen -lf - 2>/dev/null)"
-		if printf '%s\n' "$valid" | cut -d' ' -f2- | sort | cmp -s - <(grep -v '^#' "$SSH_KNOWN_HOSTS" | awk -v h="$kh" '$1 == h { $1 = ""; sub(/^ /, ""); print }' | sort); then
+	cmp="$(ssh_kh_compare "$host" "$port" "$valid")"
+	case "$cmp" in
+		same)
 			vpnsh_info "$kh のホスト鍵は保存済みのものと同じです。変更はありません"
 			return 0
-		fi
-		changed=1
-		echo "  保存済みのホスト鍵の指紋:" >&2
-		printf '%s\n' "$old_fps" | vpnsh_sanitize | sed 's/^/    /' >&2
-		echo "  今回取得したホスト鍵の指紋:" >&2
-		printf '%s\n' "$fps" | vpnsh_sanitize | sed 's/^/    /' >&2
-		if printf '%s\n' "$valid" | cut -d' ' -f2- | grep -qxF -f <(grep -v '^#' "$SSH_KNOWN_HOSTS" | awk -v h="$kh" '$1 == h { $1 = ""; sub(/^ /, ""); print }'); then
-			vpnsh_warn "保存済みの鍵の一部と一致し、種類が増えたか減ったかしています (サーバーの設定変更の可能性)"
-		else
-			vpnsh_warn "保存済みのホスト鍵と1つも一致しません。サーバーの鍵が変わったか、通信が乗っ取られている (MITM) 可能性があります"
-		fi
-	else
-		echo "  $kh のホスト鍵の指紋:" >&2
-		printf '%s\n' "$fps" | vpnsh_sanitize | sed 's/^/    /' >&2
-	fi
+			;;
+		new)
+			echo "  $kh のホスト鍵の指紋:" >&2
+			printf '%s\n' "$fps" | vpnsh_sanitize | sed 's/^/    /' >&2
+			;;
+		*)
+			changed=1
+			old_fps="$(ssh-keygen -F "$kh" -f "$SSH_KNOWN_HOSTS" 2>/dev/null | grep -v '^#' | ssh-keygen -lf - 2>/dev/null)"
+			echo "  保存済みのホスト鍵の指紋:" >&2
+			printf '%s\n' "$old_fps" | vpnsh_sanitize | sed 's/^/    /' >&2
+			echo "  今回取得したホスト鍵の指紋:" >&2
+			printf '%s\n' "$fps" | vpnsh_sanitize | sed 's/^/    /' >&2
+			if [ "$cmp" = "partial" ]; then
+				vpnsh_warn "保存済みの鍵の一部と一致し、種類が増えたか減ったかしています (サーバーの設定変更の可能性)"
+			else
+				vpnsh_warn "保存済みのホスト鍵と1つも一致しません。サーバーの鍵が変わったか、通信が乗っ取られている (MITM) 可能性があります"
+			fi
+			;;
+	esac
 	echo "  サーバーの管理者などから、正しい指紋を別の経路で確認してください。" >&2
 	confirm_strict "この指紋は正しいですか? 正しければ yes と入力してください" || vpnsh_die "保存しませんでした"
-	if [ -f "$SSH_KNOWN_HOSTS" ]; then
-		ssh-keygen -R "$kh" -f "$SSH_KNOWN_HOSTS" >/dev/null 2>&1
-		rm -f "$SSH_KNOWN_HOSTS.old"
-	fi
-	printf '%s\n' "$valid" >>"$SSH_KNOWN_HOSTS"
-	chmod 0600 "$SSH_KNOWN_HOSTS"
+	ssh_kh_replace "$host" "$port" "$valid"
 	vpnsh_info "$kh のホスト鍵を保存しました"
 	if [ -n "$changed" ]; then
 		# 鍵の縛り (-h) は登録したときのホスト鍵で判定されるので、読み込み直す必要がある
@@ -1102,51 +939,6 @@ EOF
 }
 
 # ---- setup ----
-# conf_get <ファイル> <セクション> <キー>
-conf_get() {
-	awk -v sec="$2" -v key="$3" '
-		/^[[:space:]]*\[/ { cur = $0; gsub(/[][[:space:]]/, "", cur); next }
-		cur == sec {
-			line = $0; sub(/[#;].*/, "", line)
-			n = index(line, "=")
-			if (n == 0) next
-			k = substr(line, 1, n - 1); v = substr(line, n + 1)
-			gsub(/^[[:space:]]+|[[:space:]]+$/, "", k); gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
-			if (tolower(k) == tolower(key)) { print v; exit }
-		}' <"$1"
-}
-
-is_ipv4() { printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
-
-# conf_sync_warning <ファイル>  .conf が同期・共有されやすい場所にあれば警告する
-conf_sync_warning() {
-	local real home lower
-	real="$(perl -MCwd=abs_path -e 'print abs_path($ARGV[0]) // ""' "$1")"
-	home="$(perl -MCwd=abs_path -e 'print abs_path($ARGV[0]) // ""' "$HOME")"
-	lower="$(printf '%s' "$real" | tr '[:upper:]' '[:lower:]')"
-	home="$(printf '%s' "$home" | tr '[:upper:]' '[:lower:]')"
-	case "$lower" in
-		"$home/library/mobile documents/"* | "$home/library/cloudstorage/"* | "$home/dropbox"* | "$home/google drive"* | "$home/onedrive"* | "$home/box"* | /volumes/*)
-			vpnsh_warn "$1 は同期フォルダか外部ボリュームにあります。秘密鍵が他の端末やクラウドに残る恐れがあります。取り込んだら同期先からも確実に削除してください"
-			;;
-		"$home/desktop/"* | "$home/documents/"*)
-			vpnsh_warn "$1 はデスクトップか書類フォルダにあります。iCloud の「デスクトップと書類」を使っている場合はクラウドに同期されます。取り込んだら確実に削除してください"
-			;;
-	esac
-}
-
-env_write() {
-	# env_write <KEY> <VALUE>  .env の KEY を置き換える (無ければ追記)
-	local tmp="$VPNSH_ENV_FILE.tmp.$$"
-	if [ -f "$VPNSH_ENV_FILE" ]; then
-		grep -v "^$1=" "$VPNSH_ENV_FILE" >"$tmp" || true
-	else
-		: >"$tmp"
-	fi
-	printf '%s=%s\n' "$1" "$2" >>"$tmp"
-	chmod 0600 "$tmp" && mv -f "$tmp" "$VPNSH_ENV_FILE"
-	VPNSH_ENV_LOADED=""  # 読み込み直させる
-}
 
 cmd_setup() {
 	if [ "${1:-}" != "--import" ] || [ -z "${2:-}" ]; then vpnsh_die "使い方: vpnsh setup --import <NordVPN の WireGuard .conf>" 2; fi
@@ -1154,31 +946,9 @@ cmd_setup() {
 	[ -f "$conf" ] || vpnsh_die "ファイルがありません: $conf"
 	conf_sync_warning "$conf"
 
-	local priv addr pub endpoint psk host port ip4addr
-	priv="$(conf_get "$conf" Interface PrivateKey)"
-	addr="$(conf_get "$conf" Interface Address)"
-	pub="$(conf_get "$conf" Peer PublicKey)"
-	endpoint="$(conf_get "$conf" Peer Endpoint)"
-	psk="$(conf_get "$conf" Peer PresharedKey)"
-	[ -n "$psk" ] && vpnsh_die "PresharedKey 付きの設定には対応していません"
-	kc_valid_key "$priv" || vpnsh_die ".conf の [Interface] PrivateKey が見つからないか、形式が正しくありません"
-	kc_valid_key "$pub" || vpnsh_die ".conf の [Peer] PublicKey が見つからないか、形式が正しくありません"
-	ip4addr="$(printf '%s' "$addr" | tr ',' '\n' | tr -d ' ' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]+)?$' | head -n 1)"
-	[ -n "$ip4addr" ] || vpnsh_die ".conf の [Interface] Address に IPv4 アドレスがありません: $addr"
-	# アドレスは /32 にそろえる (/16 などのままだとルーティングの期待値と合わない)
-	if [ "${ip4addr#*/}" != "32" ]; then
-		vpnsh_info "Address $ip4addr を ${ip4addr%/*}/32 にそろえます"
-		ip4addr="${ip4addr%/*}/32"
-	fi
-	host="${endpoint%:*}"; port="${endpoint##*:}"
-	case "$port" in "" | *[!0-9]*) vpnsh_die ".conf の [Peer] Endpoint の形式が正しくありません: $endpoint" ;; esac
-	if ! is_ipv4 "$host"; then
-		local resolved
-		resolved="$(dscacheutil -q host -a name "$host" 2>/dev/null | sed -n 's/^ip_address: //p' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)"
-		[ -n "$resolved" ] || vpnsh_die "Endpoint のホスト名 $host を IPv4 アドレスに解決できません"
-		vpnsh_info "Endpoint $host を $resolved に解決しました (gluetun にはホスト名を渡せないため)"
-		host="$resolved"
-	fi
+	setup_parse_conf "$conf"
+	local priv="$SETUP_PRIV" pub="$SETUP_PUB" host="$SETUP_HOST" port="$SETUP_PORT" ip4addr="$SETUP_ADDR"
+	SETUP_PRIV=""
 
 	# 書き換える前に、Docker に届くことと、作り直しで切れるシェルがあるかを確かめる
 	local r0 n0 recreate_ok=""

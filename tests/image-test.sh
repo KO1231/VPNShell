@@ -33,6 +33,33 @@ out="$(run --user 0 --entrypoint sh "$IMAGE" -c "$probe")"
 out="$(run --entrypoint perl "$IMAGE" -e 'my $p = fork(); if (!$p) { sleep 10; exit } my %n = (aarch64 => 117, x86_64 => 101); chomp(my $m = `uname -m`); print syscall($n{$m}, 16, $p, 0, 0) == 0 ? "attached" : "denied"; kill 9, $p')"
 [ "$out" = "denied" ] && ok "ptrace はできない (seccomp)" || ng "ptrace ができる: $out"
 
+# 使わない・攻撃に使われやすいシステムコール (SysV IPC・POSIX メッセージキュー・Linux AIO・vmsplice・adjtimex・name_to_handle_at・modify_ldt) は EPERM
+out="$(run --entrypoint perl "$IMAGE" -e 'my %nr = (x86_64 => [206, 240, 278, 159, 303, 154], aarch64 => [0, 180, 75, 171, 264]); chomp(my $m = `uname -m`);
+	$nr{$m} or die "unknown arch: $m\n";
+	my @r; push @r, defined(shmget(0, 4096, 0600)) ? "shm" : $!{EPERM} ? () : "shm:$!";
+	push @r, defined(msgget(0, 0600)) ? "msg" : $!{EPERM} ? () : "msg:$!";
+	push @r, defined(semget(0, 1, 0600)) ? "sem" : $!{EPERM} ? () : "sem:$!";
+	my $buf = "\0" x 256; for my $n (@{ $nr{$m} }) { syscall($n, 1, $buf, 0, 0) == -1 && $!{EPERM} or push @r, "nr$n:$!" }
+	print @r ? "@r" : "denied"' 2>&1)"
+[ "$out" = "denied" ] && ok "SysV IPC・メッセージキュー・AIO・vmsplice などは使えない (seccomp)" || ng "使えてしまうシステムコールがある: $out"
+
+# listmount / statmount は ENOSYS で拒否する (util-linux などは ENOSYS のときだけ /proc/self/mountinfo を読む方式に切り替える)
+out="$(run --entrypoint perl "$IMAGE" -e 'my @r; for my $n (457, 458) { syscall($n, 0, 0, 0, 0) == -1 && $!{ENOSYS} or push @r, "nr$n:$!" } print @r ? "@r" : "enosys"' 2>&1)"
+[ "$out" = "enosys" ] && ok "listmount / statmount は ENOSYS で拒否する (seccomp)" || ng "listmount / statmount の結果が想定外: $out"
+
+# 32 ビット互換の入口 (x86 の int 0x80・x32・AArch32) はプロファイルに含めない (含めないアーキテクチャのシステムコールはプロセスごと止められる)
+out="$(perl -MJSON::PP -e 'local $/; my $p = decode_json(<STDIN>); print join(" ", map { "$_->{architecture}=" . (defined $_->{subArchitectures} ? join(",", @{ $_->{subArchitectures} }) : "none") } @{ $p->{archMap} })' <"$ROOT/templates/seccomp-work.json" 2>&1)"
+[ "$out" = "SCMP_ARCH_X86_64=none SCMP_ARCH_AARCH64=none" ] && ok "32 ビット互換の入口は使えない (seccomp のアーキテクチャは x86_64・aarch64 だけ)" || ng "seccomp のアーキテクチャが想定外: $out"
+
+# ソケットは UNIX・IPv4・IPv6・netlink (ROUTE・SOCK_DIAG) だけ、socketpair は UNIX だけ (それ以外は対応していない種類でも EPERM になる)
+out="$(run --entrypoint perl "$IMAGE" -e '
+	for my $f ([1, 1, 0], [2, 2, 0], [10, 2, 0], [16, 3, 0], [16, 3, 4]) { socket(my $s, $f->[0], $f->[1], $f->[2]) or print "denied:@$f($!) " }
+	for my $f ([30, 5, 0], [29, 2, 1], [31, 1, 0], [38, 5, 0], [40, 1, 0], [41, 2, 0], [16, 3, 12], [16, 3, 16]) { socket(my $s, $f->[0], $f->[1], $f->[2]) and print "allowed:@$f "; $!{EPERM} or print "not-eperm:@$f($!) " }
+	socketpair(my $a, my $b, 1, 1, 0) or print "denied-pair:1($!) ";
+	socketpair(my $c, my $d, 30, 5, 0) and print "allowed-pair:30 "; $!{EPERM} or print "not-eperm-pair:30($!) ";
+	print "done"' 2>&1)"
+[ "$out" = "done" ] && ok "作れるソケットの種類が絞られている (TIPC・CAN・Bluetooth・AF_ALG・vsock・KCM・netlink の他のプロトコルは作れない)" || ng "ソケットの種類の結果が想定外: $out"
+
 out="$(run --entrypoint bash "$IMAGE" -ic 'echo "$PATH"' 2>/dev/null | tail -n 1)"
 # shellcheck disable=SC2088  # 表示の文字列
 case "$out" in *":/home/vpnsh/.local/bin") ok "~/.local/bin は PATH の最後" ;; *) ng "PATH の順序が想定外: $out" ;; esac

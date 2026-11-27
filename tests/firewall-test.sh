@@ -20,6 +20,8 @@ VPNSH_ENV_FILE="$WORK/env"
 . "$ROOT/lib/keychain.sh"
 # shellcheck source=lib/gluetun.sh
 . "$ROOT/lib/gluetun.sh"
+# shellcheck source=lib/mount.sh
+. "$ROOT/lib/mount.sh"
 vpnsh_clean_env
 export VPNSH_UID VPNSH_GID
 VPNSH_UID="$(id -u)"; VPNSH_GID="$(id -g)"
@@ -119,6 +121,11 @@ gl_inspect
 echo "== 2. 遮断ルール・ルーティングの改ざんを検出する"
 # tamper <説明> <加えるコマンド> <戻すコマンド>  (gluetun の中で実行する)
 tamper() {
+	# 改ざんする前は期待値と一致していること (ほかの理由で検査に落ちているのを「検出した」と数えない)
+	if ! gl_fw_check >/dev/null 2>&1; then
+		ng "改ざんする前から期待値と一致しない: $1"
+		return
+	fi
 	if ! vpnsh_docker exec "$NAME" sh -c "$2" >/dev/null 2>&1; then
 		skip "この環境では「$1」を試せません"
 		return
@@ -241,6 +248,33 @@ else
 	case "$out" in *"CapEff:	0000000000000000"*"NoNewPrivs:	1"*) ok "work は権限なし (CapEff=0, NoNewPrivs=1)" ;; *) ng "work の権限が想定外: $out" ;; esac
 	case "$out" in *"nameserver 127.0.0.1"*) ok "work の DNS は 127.0.0.1 に固定" ;; *) ng "work の DNS が想定外: $out" ;; esac
 
+	echo "== 4e. 起動前チェックは項目ごとの異常を検出する"
+	out="$(vpnsh_compose run --rm --no-deps -T -e VPNSH_GLUETUN_NETNS= -e VPNSH_VERBOSE=1 work check 2>&1)"
+	rc=$?
+	[ "$rc" -eq 125 ] && ngline "名前空間が渡されていません" && ok "gluetun の名前空間が渡されなければ失敗する (vpnsh を経由しない起動)" || ng "名前空間が渡されないときの結果が想定外 (終了コード $rc): $out"
+	# gluetun の外 (IPv6 が有効・低いポートを使える・別の DNS) で、ヘルスサーバーと認証なしの制御用サーバーの代わりを立てて起動前チェックを動かす
+	out="$(vpnsh_docker run --rm --network bridge --cap-drop ALL --security-opt no-new-privileges \
+		--sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv4.ip_unprivileged_port_start=0 --dns 192.0.2.53 \
+		-e VPNSH_VERBOSE=1 -e EXPECTED_PUBLIC_IP=203.0.113.7 -e VPNSH_IP_CHECK_URLS="http://127.0.0.1:18081/ http://127.0.0.1:18082/" \
+		--entrypoint sh vpnshell-work:local -c '
+			perl -MIO::Socket::INET -e '\''
+				for my $p (9999, 8000) {
+					next if fork;
+					my $s = IO::Socket::INET->new(LocalAddr => "127.0.0.1", LocalPort => $p, Listen => 8, ReuseAddr => 1) or die;
+					while (my $c = $s->accept) { while (<$c>) { last if /^\r?\n$/ } print $c "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"; close $c }
+					exit;
+				}
+			'\'' &
+			sleep 1
+			VPNSH_GLUETUN_NETNS="$(readlink /proc/self/ns/net)" /usr/local/lib/vpnsh/preflight.sh
+			echo "rc=$?"' 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+	case "$out" in *"rc=1") ok "異常がある起動前チェックは失敗で終わる" ;; *) ng "起動前チェックの終了コードが想定外: $out" ;; esac
+	for item in "IPv6 が無効になっていません" "権限の無いプロセスが 0 番以上のポートで待ち受けられます" "DNS の設定が想定外です (nameserver: 192.0.2.53 )" "制御用サーバーが 401 を返しません (200)" "応答した確認サービスが 0 件"; do
+		ngline "$item" && ok "検出する: $item" || ng "検出しない: $item"
+	done
+	printf '%s\n' "$out" | grep -F '[OK]' | grep -qF "ヘルスサーバーが 200" && printf '%s\n' "$out" | grep -F '[OK]' | grep -qF "ネットワーク名前空間が一致" &&
+		ok "健全な項目 (ヘルスサーバーが 200・名前空間の一致) は通す" || ng "健全な項目を通さない: $out"
+
 	echo "== 4b. work イメージと実行時の固さ"
 	out="$(vpnsh_compose --progress quiet run --rm --no-deps -T --entrypoint sh work -c 'echo "suid=$(find / -xdev -perm /6000 -type f 2>/dev/null | wc -l) caps=$(getcap -r / 2>/dev/null | wc -l)"' 2>&1)"
 	[ "$out" = "suid=0 caps=0" ] && ok "setuid / setgid とファイル capability が無い" || ng "setuid / capability が残っている: $out"
@@ -269,6 +303,21 @@ else
 	vpnsh_compose --progress quiet run --rm --no-deps -T --entrypoint sh work -c 'echo x > ~/f' >/dev/null 2>&1
 	after="$(vpnsh_docker volume ls -q --filter dangling=true | wc -l | tr -d ' ')"
 	[ "$before" = "$after" ] && ok "使い捨てのホームはシェルの終了で消える (未使用のボリューム ${before} → ${after})" || ng "ホームのボリュームが残った (未使用のボリューム ${before} → ${after})"
+	# mount_run <ro|rw> <コマンド>  vpnsh と同じ引数 (mnt_run_args) でカレントディレクトリの代わりのディレクトリをマウントして work を動かす
+	mount_run() {
+		local args=() line
+		while IFS= read -r line; do [ -n "$line" ] && args+=("$line"); done <<EOF
+$(SESSION_MOUNT_SRC="$WORK/mnt" SESSION_MOUNT_DISPLAY="$WORK/mnt" VPNSH_MOUNT="$1" mnt_run_args)
+EOF
+		vpnsh_compose --progress quiet run --rm --no-deps -T "${args[@]}" --entrypoint sh work -c "$2" 2>&1
+	}
+	mkdir -p "$WORK/mnt" && echo hello >"$WORK/mnt/f"
+	out="$(mount_run ro 'cat /work/f; touch /work/x 2>/dev/null && echo wrote; echo "$VPNSH_MOUNT $(pwd)"')"
+	[ "$out" = "hello
+ro /work" ] && [ ! -e "$WORK/mnt/x" ] && ok "-m のマウントは /work で読めるが、書き込めない" || ng "-m のマウントの結果が想定外: $out"
+	out="$(mount_run rw 'touch /work/x && echo wrote')"
+	[ "$out" = "wrote" ] && [ -e "$WORK/mnt/x" ] && ok "--mount-cwd-rw のマウントは書き込める" || ng "--mount-cwd-rw のマウントの結果が想定外: $out"
+	rm -f "$WORK/mnt/f" "$WORK/mnt/x"; rmdir "$WORK/mnt"
 
 	echo "== 4c. 漏れの実地検査 (vpnsh check --full の検査)"
 	diag_full() {
