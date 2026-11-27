@@ -68,7 +68,7 @@ setup_parse_conf() {
 		ip4addr="${ip4addr%/*}/32"
 	fi
 	host="${endpoint%:*}"; port="${endpoint##*:}"
-	case "$port" in "" | *[!0-9]*) vpnsh_die ".conf の [Peer] Endpoint の形式が正しくありません: $endpoint" ;; esac
+	fw_is_port "$port" || vpnsh_die ".conf の [Peer] Endpoint の形式が正しくありません: $endpoint"
 	if ! is_ipv4 "$host"; then
 		resolved="$(conf_resolve_ipv4 "$host")"
 		[ -n "$resolved" ] || vpnsh_die "Endpoint のホスト名 $host を IPv4 アドレスに解決できません"
