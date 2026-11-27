@@ -19,14 +19,12 @@ cur_ub_ref="$(sed -n 's/^[[:space:]]*BASE_IMAGE:[[:space:]]*\(ubuntu:[^[:space:]
 cur_gl_tag="${cur_gl_ref%%@*}"; cur_gl_tag="${cur_gl_tag#*:}"
 cur_ub_tag="${cur_ub_ref%%@*}"; cur_ub_tag="${cur_ub_tag#*:}"
 
+# shellcheck source=lib/pins.sh
+. "$ROOT/lib/pins.sh"
+
 # index_digest <イメージ:タグ>  マルチアーキテクチャのインデックスのダイジェスト (arm64 と amd64 を含むこと)
 index_digest() {
-	command docker --context "$CONTEXT" buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null | perl -MJSON::PP -e '
-		local $/; my $m = eval { decode_json(<STDIN>) } or exit 1;
-		my %arch = map { ($_->{platform}{architecture} // "") => 1 } @{ $m->{manifests} // [] };
-		exit 2 unless $arch{arm64} && $arch{amd64};
-		print $m->{digest} if ($m->{digest} // "") =~ /\Asha256:[0-9a-f]{64}\z/;
-	'
+	command docker --context "$CONTEXT" buildx imagetools inspect "$1" --format '{{json .Manifest}}' 2>/dev/null | pins_index_digest
 }
 
 # gluetun の GitHub のリポジトリ (ここから移動していれば警告する)

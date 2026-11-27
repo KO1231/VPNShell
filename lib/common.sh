@@ -156,6 +156,12 @@ vpnsh_env_validate() {
 	fi
 	return 0
 }
+
+# ensure_state_dir  state/ を自分だけが読み書きできる権限で作る
+ensure_state_dir() {
+	mkdir -p "$VPNSH_STATE_DIR" && chmod 0700 "$VPNSH_STATE_DIR"
+}
+
 # vpnsh_env_get <KEY>  値を stdout に出す (無ければ空。同じキーが複数あれば最後のもの)
 vpnsh_env_get() {
 	[ "$VPNSH_ENV_LOADED" = "$VPNSH_ENV_FILE" ] || vpnsh_env_load
@@ -180,4 +186,19 @@ vpnsh_table() {
 			print "$line\n";
 		}
 	'
+}
+
+# git の作成者情報 (Mac の git config --global から。ファイルはマウントしない)
+git_identity_args() {
+	local name="" email=""
+	# Command Line Tools が無い Mac で /usr/bin/git を呼ぶとインストールのダイアログが出るので避ける
+	if [ "$(command -v git)" = "/usr/bin/git" ] && ! xcode-select -p >/dev/null 2>&1; then
+		return 0
+	fi
+	command -v git >/dev/null 2>&1 || return 0
+	name="$(git config --global user.name 2>/dev/null | LC_ALL=C tr -d '\000-\037\177' | cut -c1-200)"
+	email="$(git config --global user.email 2>/dev/null | LC_ALL=C tr -d '\000-\037\177' | cut -c1-200)"
+	[ -n "$name" ] && printf '%s\n' "GIT_AUTHOR_NAME=$name" "GIT_COMMITTER_NAME=$name"
+	[ -n "$email" ] && printf '%s\n' "GIT_AUTHOR_EMAIL=$email" "GIT_COMMITTER_EMAIL=$email"
+	return 0
 }

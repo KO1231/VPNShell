@@ -300,13 +300,15 @@ gl_create() {
 
 # 外部IPの確認サービスの既定値
 GL_IP_CHECK_URLS_DEFAULT="https://1.1.1.1/cdn-cgi/trace https://api.ipify.org https://checkip.amazonaws.com"
+# 経路を調べるコマンド (テストでは偽物に差し替える)
+GL_ROUTE="/sbin/route"
 
 # gl_host_vpn_routed  Mac から VPN の接続先へのパケットが Mac の VPN (utun) に入るなら 0
 gl_host_vpn_routed() {
 	local ip
 	ip="$(vpnsh_env_get WIREGUARD_ENDPOINT_IP)"
 	[ -n "$ip" ] || return 1
-	/sbin/route -n get "$ip" 2>/dev/null | awk '$1 == "interface:" && $2 ~ /^utun[0-9]+$/ { f = 1 } END { exit !f }'
+	"$GL_ROUTE" -n get "$ip" 2>/dev/null | awk '$1 == "interface:" && $2 ~ /^utun[0-9]+$/ { f = 1 } END { exit !f }'
 }
 
 # gl_mac_public_ip  Mac の外部IPを確認サービスに順に問い合わせ、最初に読み取れたものを出す (どこからも読み取れなければ 1)
@@ -380,4 +382,68 @@ gl_wait_healthy() {
 		[ $((i % 2)) -eq 0 ] && printf '.' >&2
 		sleep 0.5
 	done
+}
+
+# Docker (OrbStack) に接続できないときの案内
+docker_unreachable() {
+	vpnsh_err "Docker (OrbStack) に接続できません: ${GL_DOCKER_ERROR:-}"
+	vpnsh_die "OrbStack が起動しているか確認してください (\`orb start\`)" "$VPNSH_EXIT_PREFLIGHT"
+}
+
+# gluetun が healthy になるまで待つ上限 (秒)
+GL_HEALTH_WAIT=60
+
+# ---- gluetun を使える状態にして、ホスト側の検査をする (成功すると SESSION_NETNS が入る) ----
+SESSION_NETNS=""
+prepare_gluetun() {
+	local r
+	gl_inspect; r=$?
+	[ "$r" -eq 2 ] && docker_unreachable
+	vpnsh_timing "gluetun の状態の取得 (docker inspect)"
+	if [ "$r" -eq 1 ]; then
+		lock_acquire
+		gl_inspect; r=$?
+		if [ "$r" -eq 1 ]; then
+			gl_create || { lock_release; exit "$VPNSH_EXIT_PREFLIGHT"; }
+		fi
+		lock_release
+	fi
+	gl_inspect || docker_unreachable
+	case "$GL_STATUS" in
+		exited)
+			# 起動する前に、作成時のとおりか確かめる
+			gl_verify || exit "$VPNSH_EXIT_PREFLIGHT"
+			vpnsh_info "停止している gluetun を起動します"
+			vpnsh_docker start "$VPNSH_GLUETUN_NAME" >/dev/null || vpnsh_die "gluetun を起動できません" "$VPNSH_EXIT_PREFLIGHT"
+			;;
+		created)
+			# 一度も起動していない (作成の途中で止まった) コンテナには secret が入っていない
+			vpnsh_die "gluetun が作成途中の状態です。\`vpnsh up --recreate\` で作り直してください" "$VPNSH_EXIT_PREFLIGHT"
+			;;
+		paused) vpnsh_die "gluetun が一時停止 (paused) しています。\`vpnsh restart\` を実行してください" "$VPNSH_EXIT_PREFLIGHT" ;;
+	esac
+	gl_wait_healthy "$GL_HEALTH_WAIT" || exit "$VPNSH_EXIT_PREFLIGHT"
+	vpnsh_timing "gluetun の healthy の確認"
+	host_checks || exit "$VPNSH_EXIT_PREFLIGHT"
+}
+
+# host_checks  (healthy な gluetun に対して) 整合性・未適用の変更・ファイアウォール
+host_checks() {
+	gl_verify || return 1
+	vpnsh_timing "gluetun の整合性 (ID・イメージ・Env)"
+	local pending
+	if pending="$(gl_pending_changes)"; then
+		vpnsh_err ".env の変更が gluetun に適用されていません ($(echo "$pending" | tr '\n' ' '))。\`vpnsh up\` で適用してください"
+		return 1
+	fi
+	vpnsh_timing "未適用の変更の確認"
+	if ! gl_fw_check; then
+		vpnsh_err "遮断ルールが想定どおりではないため、シェルを起動しません。VPN の再接続中の可能性もあるので、少し待ってから再実行してください。続く場合は \`vpnsh up --recreate\`"
+		return 1
+	fi
+	vpnsh_verbose "ファイアウォールは期待値どおり ($FW_NETNS)"
+	vpnsh_timing "遮断ルール・ルーティングの比較"
+	# shellcheck disable=SC2034  # bin/vpnsh の run_work が work に渡す
+	SESSION_NETNS="$FW_NETNS"
+	return 0
 }
