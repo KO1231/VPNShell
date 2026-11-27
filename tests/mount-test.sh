@@ -32,6 +32,8 @@ PASS=0
 FAIL=0
 ok() { PASS=$((PASS + 1)); printf '  \033[32mOK\033[0m   %s\n' "$*"; }
 ng() { FAIL=$((FAIL + 1)); printf '  \033[31mNG\033[0m   %s\n' "$*"; }
+# skip <説明>  省略したことを表示する (VPNSH_CI=1 なら NG にする)
+skip() { if [ "${VPNSH_CI:-}" = 1 ]; then ng "省略した (CI では省略しない): $*"; else printf '  (%s)\n' "$*"; fi; }
 
 allow() {
 	local out
@@ -48,7 +50,7 @@ allow "$T/allowed/proj/deep"
 allow "$T/outside/to-proj"
 allow "$T/allowed/日本語"
 # APFS は大文字小文字を区別しないので、大文字で書いても同じ実体として許可される
-[ -d "$T/allowed/PROJ" ] && allow "$T/allowed/PROJ" || echo "  (このファイルシステムは大文字小文字を区別するので省略)"
+[ -d "$T/allowed/PROJ" ] && allow "$T/allowed/PROJ" || skip "このファイルシステムは大文字小文字を区別するので省略"
 
 echo "== 拒否されるもの"
 deny "$T/allowed"

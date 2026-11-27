@@ -14,6 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  VPNSH_CI: "1"
   SHELLCHECK_IMAGE: koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
 
 jobs:
@@ -62,14 +63,27 @@ jobs:
       - name: zsh completion syntax
         run: zsh -n completions/_vpnsh
 
+      - name: Perl syntax with the macOS perl (SSH relay)
+        run: /usr/bin/perl -c scripts/ssh-relay
+
       - name: Unit tests
         run: /bin/bash tests/unit-test.sh
 
       - name: Mount safety tests
         run: /bin/bash tests/mount-test.sh
 
-  image:
-    runs-on: ubuntu-latest
+      - name: SSH tests (without Docker)
+        env:
+          VPNSH_TEST_SKIP_DOCKER: "1"
+        run: /bin/bash tests/ssh-test.sh
+
+  image-arch:
+    name: image (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -77,8 +91,40 @@ jobs:
         with:
           persist-credentials: false
 
+      # vpnsh build と同じく、実行するユーザーの UID・GID でビルドする
       - name: Build the work image
-        run: docker compose -f compose.yaml --env-file .env.example --profile work build work
+        run: VPNSH_UID="$(id -u)" VPNSH_GID="$(id -g)" docker compose -f compose.yaml --env-file .env.example --profile work build work
 
       - name: Check the image is hardened
         run: tests/image-test.sh
+
+      - name: Pull the pinned gluetun image
+        run: docker compose -f compose.yaml --env-file .env.example pull gluetun
+
+      - name: SSH tests (with Docker)
+        env:
+          VPNSH_CONTEXT: default
+        run: /bin/bash tests/ssh-test.sh
+
+      # gluetun の中で ip6tables-legacy を使えるように、ホストでカーネルモジュールを読み込む
+      - name: Load the legacy ip6tables kernel modules
+        run: sudo modprobe -a ip6_tables ip6table_filter
+
+      - name: Firewall tests
+        env:
+          VPNSH_CONTEXT: default
+        run: /bin/bash tests/firewall-test.sh
+
+  # 必須のチェック (image) として、両方のアーキテクチャの結果をまとめる
+  image:
+    needs: image-arch
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: All architectures passed
+        env:
+          RESULT: ${{ needs.image-arch.result }}
+        run: |
+          echo "image-arch: $RESULT"
+          [ "$RESULT" = "success" ]

@@ -9,7 +9,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 # CDPATH があると、相対パスの cd が別のディレクトリに移り (移った先も表示する)、リポジトリの場所を取り違えるため
 unset CDPATH
 
-VPNSH_VERSION="1.0.2"
+VPNSH_VERSION="1.0.3"
 
 # 対象のプロジェクトやコンテナ名を環境変数で上書きさせない (テストは lib を直接使う)
 unset VPNSH_PROJECT VPNSH_CONTEXT VPNSH_GLUETUN_NAME VPNSH_STATE_DIR VPNSH_ENV_FILE VPNSH_TEST_SSH_CONFIG
@@ -692,13 +692,19 @@ cmd_logs() {
 }
 
 cmd_build() {
-	local hash arch want
+	local hash arch want gl_ref
 	hash="$(work_build_hash)"
 	vpnsh_info "work イメージをビルドします (ビルド時の通信は VPN を通らず、Mac の回線から出ます)"
 	VPNSH_BUILD_HASH="$hash" vpnsh_compose_any --profile work build work || vpnsh_die "ビルドに失敗しました"
 	arch="$(vpnsh_docker image inspect -f '{{.Architecture}}' vpnshell-work:local 2>/dev/null)"
 	case "$(uname -m)" in arm64) want=arm64 ;; x86_64) want=amd64 ;; *) want="$(uname -m)" ;; esac
 	[ "$arch" = "$want" ] || vpnsh_warn "work イメージのアーキテクチャが $arch です (この Mac は $want)。エミュレーションで遅くなります"
+	gl_ref="$(gl_pinned_image)"
+	[ -n "$gl_ref" ] || vpnsh_die "compose.yaml から固定した gluetun のイメージを読み取れません"
+	if ! vpnsh_docker image inspect "$gl_ref" >/dev/null 2>&1; then
+		vpnsh_info "固定した gluetun のイメージを取得します (この通信も VPN を通らず、Mac の回線から出ます)"
+		vpnsh_timeout 600 docker --context "$VPNSH_CONTEXT" pull -q "$gl_ref" >/dev/null || vpnsh_die "gluetun のイメージを取得できません ($gl_ref)"
+	fi
 	vpnsh_info "ビルドしました"
 }
 

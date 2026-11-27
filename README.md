@@ -69,6 +69,8 @@ vpnsh help                    # list the commands
 
 For security, mounting is restricted to directories under `mount-root` (`~/Projects` by default). You can change it with `vpnsh config set mount-root <directory>`.
 
+While the NordVPN app on your Mac is connected to your Dedicated IP server, vpnsh cannot connect to the same server (connecting the app to any other server is fine). If your Mac's public IP is your Dedicated IP, vpnsh warns you and asks whether to continue before waiting for the VPN connection.
+
 ### SSH
 
 ```zsh

@@ -158,6 +158,25 @@ try "環境変数の重複" 'GL_DUP_ENV=FOO'
 	ok "sysctl の足りない gluetun を「未適用の変更」として見つける" || ng "sysctl の未適用を見つけない"
 unset -f vpnsh_docker
 
+echo "== 3b. Mac の外部IPの読み取り (確認サービスの代わりにファイルを読む)"
+printf 'fl=1\nip=203.0.113.7\nts=1\n' >"$T/ip-trace"
+printf '203.0.113.8' >"$T/ip-plain"
+printf '203.0.113.9\n' >"$T/ip-line"
+printf '<html>\n<body>203.0.113.1</body>\n' >"$T/ip-html"
+: >"$T/ip-empty"
+# macip <URL...>  .env の VPNSH_IP_CHECK_URLS をその URL にして gl_mac_public_ip を呼び、結果と終了コードを出す
+macip() { ( VPNSH_ENV_FILE="$T/env-macip"; printf 'VPNSH_IP_CHECK_URLS=%s\n' "$*" >"$VPNSH_ENV_FILE"; gl_mac_public_ip; echo " rc=$?" ); }
+out="$(macip "file://$T/ip-trace")"
+[ "$out" = "203.0.113.7 rc=0" ] && ok "Cloudflare の trace の形式 (ip= の行) を読む" || ng "trace の形式の結果が想定外: $out"
+out="$(macip "file://$T/ip-plain")"
+[ "$out" = "203.0.113.8 rc=0" ] && ok "IP だけの応答 (末尾に改行が無い) を読む" || ng "改行の無い応答の結果が想定外: $out"
+out="$(macip "file://$T/ip-line")"
+[ "$out" = "203.0.113.9 rc=0" ] && ok "IP だけの応答 (末尾に改行がある) を読む" || ng "改行のある応答の結果が想定外: $out"
+out="$(macip "file://$T/ip-html" "file://$T/ip-empty" "file://$T/no-such-file" "file://$T/ip-line" "file://$T/ip-trace")"
+[ "$out" = "203.0.113.9 rc=0" ] && ok "IP を読み取れない応答・空の応答・失敗は飛ばし、最初に読み取れたものを出す" || ng "読み取れない応答の扱いが想定外: $out"
+out="$(macip "file://$T/ip-html" "file://$T/ip-empty" "file://$T/no-such-file")"
+[ "$out" = " rc=1" ] && ok "どこからも読み取れなければ 1 を返す" || ng "読み取れないときの結果が想定外: $out"
+
 echo "== 4. ホスト鍵の行の検査"
 K="AAAAC3NzaC1lZDI1NTE5AAAAIFk6l7nFAweysQeH6fmFfNAJ6fmh0d1zdbLfx+HwhOEq"
 ssh_valid_keyscan_line "[a.example.com]:2222 ssh-ed25519 $K" "[a.example.com]:2222" && ok "正しい行は受け付ける" || ng "正しい行を拒否した"
