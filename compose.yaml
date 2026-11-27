@@ -73,7 +73,7 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-      # Docker の既定の seccomp (moby/profiles @ 9ee3204f0d0c) から、ptrace など使わない・攻撃に使われやすいシステムコールと 32 ビット互換の入口を外したもの
+      # Docker の既定の seccomp (moby/profiles @ 9ee3204f0d0c) から、ptrace など使わない・攻撃に使われやすいシステムコールと 32 ビット互換の入口を外し、ソケットを UNIX・IPv4・IPv6・netlink に絞ったもの
       - seccomp=./templates/seccomp-work.json
     init: true
     stop_signal: SIGHUP
