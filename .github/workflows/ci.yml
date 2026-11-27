@@ -77,8 +77,13 @@ jobs:
           VPNSH_TEST_SKIP_DOCKER: "1"
         run: /bin/bash tests/ssh-test.sh
 
-  image:
-    runs-on: ubuntu-latest
+  image-arch:
+    name: image (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -91,3 +96,17 @@ jobs:
 
       - name: Check the image is hardened
         run: tests/image-test.sh
+
+  # 必須のチェック (image) として、両方のアーキテクチャの結果をまとめる
+  image:
+    needs: image-arch
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: All architectures passed
+        env:
+          RESULT: ${{ needs.image-arch.result }}
+        run: |
+          echo "image-arch: $RESULT"
+          [ "$RESULT" = "success" ]
