@@ -47,6 +47,10 @@ out="$(run --entrypoint perl "$IMAGE" -e 'my %nr = (x86_64 => [206, 240, 278, 15
 out="$(run --entrypoint perl "$IMAGE" -e 'my @r; for my $n (457, 458) { syscall($n, 0, 0, 0, 0) == -1 && $!{ENOSYS} or push @r, "nr$n:$!" } print @r ? "@r" : "enosys"' 2>&1)"
 [ "$out" = "enosys" ] && ok "listmount / statmount は ENOSYS で拒否する (seccomp)" || ng "listmount / statmount の結果が想定外: $out"
 
+# 32 ビット互換の入口 (x86 の int 0x80・x32・AArch32) はプロファイルに含めない (含めないアーキテクチャのシステムコールはプロセスごと止められる)
+out="$(perl -MJSON::PP -e 'local $/; my $p = decode_json(<STDIN>); print join(" ", map { "$_->{architecture}=" . (defined $_->{subArchitectures} ? join(",", @{ $_->{subArchitectures} }) : "none") } @{ $p->{archMap} })' <"$ROOT/templates/seccomp-work.json" 2>&1)"
+[ "$out" = "SCMP_ARCH_X86_64=none SCMP_ARCH_AARCH64=none" ] && ok "32 ビット互換の入口は使えない (seccomp のアーキテクチャは x86_64・aarch64 だけ)" || ng "seccomp のアーキテクチャが想定外: $out"
+
 out="$(run --entrypoint bash "$IMAGE" -ic 'echo "$PATH"' 2>/dev/null | tail -n 1)"
 # shellcheck disable=SC2088  # 表示の文字列
 case "$out" in *":/home/vpnsh/.local/bin") ok "~/.local/bin は PATH の最後" ;; *) ng "PATH の順序が想定外: $out" ;; esac
