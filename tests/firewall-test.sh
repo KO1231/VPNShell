@@ -306,7 +306,7 @@ echo "== 4d. VPN の通信の監視 (Mac 側、lib/netmon.sh)"
 	NETMON_INTERVAL=1
 	seqf="$WORK/netmon-seq"; outf="$WORK/netmon-out"
 	printf '%s\n' 1 1 1 0 0 2 >"$seqf"; : >"$outf"
-	netmon_probe() { local r; r="$(head -n 1 "$seqf")"; sed -i '' 1d "$seqf"; return "${r:-0}"; }
+	netmon_probe() { local r; r="$(head -n 1 "$seqf")"; tail -n +2 "$seqf" >"$seqf.next"; mv -f "$seqf.next" "$seqf"; return "${r:-0}"; }
 	(netmon_loop dummy "$$" "$outf")
 	down="$(grep -c 'VPN で通信できません' "$outf")"; up="$(grep -c '戻りました' "$outf")"; gone="$(grep -c '作り直されたか' "$outf")"
 	[ "$down" = "1" ] && echo "OK|2回続けて失敗したら「通信できません」を1回だけ出す" || echo "NG|「通信できません」が $down 回"

@@ -106,6 +106,15 @@ jobs:
           VPNSH_CONTEXT: default
         run: /bin/bash tests/ssh-test.sh
 
+      # gluetun の中で ip6tables-legacy を使えるように、ホストでカーネルモジュールを読み込む
+      - name: Load the legacy ip6tables kernel modules
+        run: sudo modprobe -a ip6_tables ip6table_filter
+
+      - name: Firewall tests
+        env:
+          VPNSH_CONTEXT: default
+        run: /bin/bash tests/firewall-test.sh
+
   # 必須のチェック (image) として、両方のアーキテクチャの結果をまとめる
   image:
     needs: image-arch
