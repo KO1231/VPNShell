@@ -45,8 +45,19 @@ jobs:
       - name: compose.yaml is valid
         run: docker compose -f compose.yaml --env-file .env.example --profile work config --quiet
 
-  macos:
-    runs-on: macos-latest
+  macos-version:
+    name: macos (macOS ${{ matrix.version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: "15"
+            runner: macos-15
+          - version: "26"
+            runner: macos-26
+          - version: "27"
+            runner: xcode-27
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -76,6 +87,20 @@ jobs:
         env:
           VPNSH_TEST_SKIP_DOCKER: "1"
         run: /bin/bash tests/ssh-test.sh
+
+  # 必須のチェック (macos) として、すべての macOS のバージョンの結果をまとめる
+  macos:
+    needs: macos-version
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: All macOS versions passed
+        env:
+          RESULT: ${{ needs.macos-version.result }}
+        run: |
+          echo "macos-version: $RESULT"
+          [ "$RESULT" = "success" ]
 
   image-arch:
     name: image (${{ matrix.runner }})
