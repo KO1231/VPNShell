@@ -19,7 +19,7 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -92,7 +92,7 @@ jobs:
   macos:
     needs: macos-version
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: All macOS versions passed
@@ -144,7 +144,7 @@ jobs:
   image:
     needs: image-arch
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: All architectures passed
